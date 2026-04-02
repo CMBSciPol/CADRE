@@ -1,0 +1,72 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel"]
+
+[project]
+authors = [
+  {email = "wastondev@gmail.com", name = "Wassim Kabalan"}
+]
+dependencies = [
+  "equinox",
+  "jax",
+  "jaxtyping",
+  "lineax",
+  "optax",
+  "optimistix"
+]
+description = "Constraint-Aware Descent Routine Executor — JAX-native constrained optimization"
+license = {file = "LICENSE"}
+name = "cadre"
+readme = "README.md"
+requires-python = ">=3.11"
+version = "0.1.0"
+
+[project.optional-dependencies]
+all = [
+  "cadre[scipy,dev]"
+]
+dev = [
+  "pre-commit",
+  "pytest",
+  "ruff"
+]
+scipy = [
+  "cobyqa",
+  "jaxopt",
+  "scipy"
+]
+
+[tool.pyright]
+exclude = ["**/node_modules", "**/__pycache__", ".git"]
+executionEnvironments = [
+  {root = "src"}
+]
+include = ["src"]
+pythonPlatform = "Linux"
+pythonVersion = "3.11"
+reportGeneralTypeIssues = false
+reportMissingImports = false
+reportUndefinedVariable = false
+
+[tool.ruff]
+fix = true
+include = ["*.py", "*.ipynb"]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = [
+  "E203",
+  "E402",
+  "E501",
+  "E731",
+  "E741",
+  "F722",
+  "F821",
+  "UP007"
+]
+select = ["E", "F", "I", "UP", "W"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = {find = {include = ["cadre*"], where = ["src"]}}
