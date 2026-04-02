@@ -5,9 +5,11 @@
 [![PyPI](https://img.shields.io/pypi/v/cadre)](https://pypi.org/project/cadre/)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Docs: minimization](https://img.shields.io/badge/docs-minimization-blue)](https://cmbscipol.github.io/furax-cs/minimization.html)
+[![Docs: minimization](https://img.shields.io/badge/docs-minimization-blue)](https://furax-cs.readthedocs.io/en/latest/minimization.html)
 
 CADRE provides a unified interface to multiple JAX-compatible optimization backends, with first-class support for box-constrained problems via an active-set method (ADABK family).
+
+This is the minimizer used in [Furax-CS](https://github/CMBSciPol/furax-cs) package for CMB component separation.
 
 ## Installation
 
@@ -28,7 +30,7 @@ from cadre import minimize
 import jax.numpy as jnp
 
 def loss(params, target):
-    return jnp.sum((params - target) ** 2), None
+    return jnp.sum((params - target) ** 2)
 
 target = jnp.array([1.0, 2.0, 3.0])
 lower  = jnp.zeros(3)
@@ -42,6 +44,9 @@ params, state = minimize(
     upper_bound=upper,
     target=target,
 )
+
+print(f"Optimal params: {params}")
+
 ```
 
 ## Solvers
@@ -56,7 +61,7 @@ params, state = minimize(
 | `scipy_tnc`, `scipy_cobyqa` | Scipy solvers via jaxopt *(requires `cadre[scipy]`)*. |
 
 Full solver documentation and ADABK internals:
-**[cmbscipol.github.io/furax-cs/minimization.html](https://cmbscipol.github.io/furax-cs/minimization.html)**
+**[docs](https://furax-cs.readthedocs.io/en/latest/minimization.html)**
 
 ## Advanced usage
 
