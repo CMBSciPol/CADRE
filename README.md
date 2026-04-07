@@ -2,7 +2,7 @@
 
 **Constraint-Aware Descent Routine Executor** — JAX-native constrained optimization.
 
-[![PyPI](https://img.shields.io/pypi/v/cadre)](https://pypi.org/project/cadre/)
+[![PyPI](https://img.shields.io/pypi/v/jax-cadre)](https://pypi.org/project/jax-cadre/)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docs: minimization](https://img.shields.io/badge/docs-minimization-blue)](https://furax-cs.readthedocs.io/en/latest/minimization.html)
