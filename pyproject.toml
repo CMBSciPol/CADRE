@@ -16,14 +16,14 @@ dependencies = [
 ]
 description = "Constraint-Aware Descent Routine Executor — JAX-native constrained optimization"
 license = {file = "LICENSE"}
-name = "cadre"
+name = "jax-cadre"
 readme = "README.md"
 requires-python = ">=3.11"
 version = "0.1.0"
 
 [project.optional-dependencies]
 all = [
-  "cadre[scipy,dev]"
+  "jax-cadre[scipy,dev]"
 ]
 dev = [
   "pre-commit",

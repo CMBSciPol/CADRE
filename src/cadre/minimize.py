@@ -117,7 +117,9 @@ def scipy_minimize(
             try:
                 import cobyqa  # noqa: F401
             except ImportError:
-                raise ImportError("cobyqa not installed. Install with: pip install cadre[scipy]")
+                raise ImportError(
+                    "cobyqa not installed. Install with: pip install jax-cadre[scipy]"
+                )
 
         solver = ScipyBoundedMinimize(
             fun=scipy_fn,

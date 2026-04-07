@@ -14,13 +14,13 @@ This is the minimizer used in [Furax-CS](https://github/CMBSciPol/furax-cs) pack
 ## Installation
 
 ```bash
-pip install cadre
+pip install jax-cadre
 ```
 
 With optional scipy solvers (`scipy_tnc`, `scipy_cobyqa`):
 
 ```bash
-pip install cadre[scipy]
+pip install jax-cadre[scipy]
 ```
 
 ## Quick start
