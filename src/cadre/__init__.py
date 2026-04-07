@@ -47,7 +47,7 @@ def __getattr__(name: str) -> str:
     """Expose package metadata attributes lazily."""
     if name == "__version__":
         try:
-            return metadata.version("cadre")
+            return metadata.version("jax-cadre")
         except metadata.PackageNotFoundError:
             return "unknown"
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

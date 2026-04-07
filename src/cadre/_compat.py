@@ -18,7 +18,7 @@ except ImportError:
 def requires_scipy(func: Callable[Param, ReturnType]) -> Callable[Param, ReturnType]:
     """Decorator that raises ImportError if jaxopt is not available.
 
-    Apply to any function that requires the optional ``cadre[scipy]`` extras
+    Apply to any function that requires the optional ``jax-cadre[scipy]`` extras
     (``jaxopt``, ``cobyqa``, ``scipy``).
     """
     try:
