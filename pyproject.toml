@@ -18,7 +18,7 @@ description = "Constraint-Aware Descent Routine Executor — JAX-native constrai
 license = {file = "LICENSE"}
 name = "jax-cadre"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 version = "0.1.0"
 
 [project.optional-dependencies]
@@ -43,7 +43,7 @@ executionEnvironments = [
 ]
 include = ["src"]
 pythonPlatform = "Linux"
-pythonVersion = "3.11"
+pythonVersion = "3.10"
 reportGeneralTypeIssues = false
 reportMissingImports = false
 reportUndefinedVariable = false
@@ -52,7 +52,7 @@ reportUndefinedVariable = false
 fix = true
 include = ["*.py", "*.ipynb"]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 ignore = [
