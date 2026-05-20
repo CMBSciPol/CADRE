@@ -17,6 +17,7 @@ from jaxtyping import (
 
 from ._compat import requires_scipy
 from ._logging import warning
+from .constraints import BoxConstraint, Constraint, GaussianConstraint, validate_constraint
 from .solvers import SELFCONDITIONED_SOLVERS, SOLVER_NAMES, get_solver
 from .utils import condition
 
@@ -203,60 +204,189 @@ def minimize(
     max_iter: int = 1000,
     rtol: float = 1e-8,
     atol: float = 1e-8,
-    lower_bound: PyTree[Float[Array, " P"]] | None = None,
-    upper_bound: PyTree[Float[Array, " P"]] | None = None,
+    constraints: Constraint | None = None,
     precondition: bool = False,
     options: dict[str, Any] | None = None,
     refresh_steps: int = 10,
+    *,
+    lower_bound: PyTree[Float[Array, " P"]] | None = None,
+    upper_bound: PyTree[Float[Array, " P"]] | None = None,
     **fn_kwargs: Any,
 ) -> tuple[PyTree[Float[Array, " P"]], UnifiedState]:
     """
     Unified optimization interface.
 
-    Supports optax solvers, optimistix solvers (via optimistix.minimise),
-    and scipy solvers (via jaxopt.ScipyMinimize, requires ``cadre[scipy]``).
+    Supports optax solvers, optimistix solvers (via ``optimistix.minimise``),
+    and scipy solvers (via ``jaxopt.ScipyBoundedMinimize`` inside a
+    ``jax.pure_callback``; requires ``jax-cadre[scipy]``).
 
     Parameters
     ----------
     fn : Callable
-        Objective function to minimize. Should accept (params, **fn_kwargs).
+        Objective function to minimize. Should accept ``(params, **fn_kwargs)``.
     init_params : PyTree
         Initial parameter values.
     solver_name : str
-        Solver identifier. See SOLVER_NAMES for available options.
+        Solver identifier. See ``SOLVER_NAMES`` for the registered names. In
+        addition the prefix-dispatched families ``ADABK{N}`` and ``LBFGSK{N}``
+        are accepted (e.g. ``"ADABK0"``, ``"LBFGSK5"``).
     max_iter : int
         Maximum iterations.
     rtol, atol : float
-        Relative/absolute tolerance for optimization convergence.
-    lower_bound, upper_bound : PyTree, optional
-        Box constraints.
+        Relative / absolute tolerance for convergence.
+    constraints : Constraint, optional
+        The **only** sanctioned way to pass bounds or priors.
+        ``BoxConstraint(lower, upper)`` for hard box bounds, or
+        ``GaussianConstraint(loc, scale)`` for a soft ridge prior.
+        ``GaussianConstraint`` wraps ``fn`` with the prior log-likelihood
+        ``½·Σ((x−loc)/scale)²`` so that the gradient, the value, and
+        ``BestSoFarMinimiser`` all see the joint MAP objective.
+    lower_bound, upper_bound : PyTree, optional, **DEPRECATED**
+        Legacy box-constraint kwargs (keyword-only). If supplied, they are
+        transparently converted to ``constraints=BoxConstraint(...)`` and a
+        :class:`DeprecationWarning` is emitted. Will be removed in a future
+        release — pass ``constraints=BoxConstraint(lower=..., upper=...)``
+        instead.
     precondition : bool
-        Whether to apply parameter transformation and output scaling.
+        Apply min-max parameter scaling to ``[0, 1]`` and rescale ``fn`` by
+        ``1/‖∇f(x₀)‖``. Skipped for self-conditioned solvers (see
+        :data:`SELFCONDITIONED_SOLVERS`).
     options : dict, optional
-        Extra arguments passed to the solver factory (get_solver).
-        For active-set solvers (``ADABK{N}`` family) the recognised keys are:
+        Per-solver knobs. Unknown keys are forwarded to the solver factory.
 
-        * ``cooldown`` (int, default 20) — steps to suppress termination
-          after a constraint release.
-        * ``min_steps`` (int, default 10) — minimum iterations before
-          termination is considered.
-        * ``verbose_print`` (bool, default False) — print per-step debug
-          info via ``jax.debug.print`` (JIT-compatible).
-        * ``max_linesearch_steps`` (int, default 50) — maximum line-search
-          steps per iteration (active-set and ``optax_lbfgs`` solvers).
-        * ``linesearch`` (str) — linesearch variant for ``optax_lbfgs``
-          (``"zoom"`` or ``"backtracking"``).
+        Common to **all active-set solvers** (``ADABK{N}``, ``LBFGSK{N}``,
+        ``active_set``, ``active_set_sgd``, ``active_set_adabelief``,
+        ``active_set_adaw``):
+
+        * ``cooldown`` (int, default 20) — number of steps to suppress
+          termination after a constraint release; absorbs transient spikes.
+        * ``verbose_print`` (bool, default False) — per-step diagnostics via
+          ``jax.debug.print`` (JIT-compatible).
+        * ``max_linesearch_steps`` (int, default 50) — line-search budget per
+          iteration.
+        * ``linesearch`` (str) — ``"zoom"`` (strong Wolfe) or
+          ``"backtracking"`` (Armijo only).
+        * ``noise_temperature`` (float, default 0.0) — Langevin noise
+          amplitude. Effective scale ``T·exp(-decay·step) / (‖pk‖ + ε)``:
+          large when stuck, small when the step is informative. ``0.0``
+          disables noise (deterministic).
+        * ``noise_decay`` (float, default 1e-3) — exponential decay rate of
+          the noise temperature with iteration count.
+        * ``noise_key`` (int, default 0) — PRNG seed for Langevin noise.
+        * ``max_constraints_to_release`` (int|float|None) — overrides the
+          ``{N}`` prefix; ``int`` is an absolute count, ``float`` a fraction.
+
+        **LBFGSK{N}-only** keys:
+
+        * ``lbfgs_ema_decay`` (float, default 0.0) — EMA "belief factor"
+          applied to gradients before L-BFGS curvature update. ``0.0`` ⇒
+          pure L-BFGS. Set to ``0.9`` (or similar) on noisy / stochastic
+          gradients; falls back to ``optax_lbfgs`` behaviour at 0.
+        * ``memory_size`` (int, default 10) — L-BFGS history length.
+        * ``scale_init_precond`` (bool, default False) — scale the initial
+          Hessian approximation. ``False`` is safer on ill-conditioned
+          problems.
+
+        **ADABK{N}-only** keys:
+
+        * ``learning_rate`` (float, default 1.0) — AdaBelief learning rate.
+
+        **``optax_lbfgs`` keys** (off-the-shelf L-BFGS, box projection):
+
+        * ``linesearch`` — same options as above.
+        * Any ``lbfgs_zoom`` / ``lbfgs_backtrack`` factory kwarg
+          (``memory_size``, ``scale_init_precond``, ``initial_guess_strategy``,
+          ``slope_rtol``, ``curv_rtol``, ``verbose``, etc.).
+
+        **First-order optax keys** (``adam`` / ``sgd`` / ``adabelief`` /
+        ``adaw``):
+
+        * ``learning_rate`` (float) — base learning rate. Box constraints are
+          enforced by chaining ``apply_projection``.
+
+        **Optimistix keys** (``optimistix_bfgs`` / ``optimistix_lbfgs`` /
+        ``optimistix_ncg_*``): forwarded to the underlying ``optx`` solver.
+
+        **Scipy keys** (``scipy_tnc`` / ``scipy_cobyqa``): tolerance keys are
+        mapped per-method by ``minimize()``:
+
+        * ``scipy_tnc``: ``ftol = atol``, ``gtol = rtol``, ``xtol = atol``.
+        * ``scipy_cobyqa``: ``final_tr_radius = atol``.
+
+    refresh_steps : int
+        Progress-meter refresh period for optimistix solvers (best-effort).
     **fn_kwargs
-        Additional arguments passed to fn.
+        Forwarded to ``fn``.
 
     Returns
     -------
     final_params : PyTree
-        Optimized parameters.
+        Optimized parameters in original (un-preconditioned) space.
     final_state : UnifiedState
-        Final optimizer state containing best loss, best parameters, iteration count, and solver state.
+        Wraps ``best_loss``, ``best_y``, ``iter_num``, and the raw solver state.
     """
     solver_name = cast(SOLVER_NAMES, solver_name)
+
+    # --- Deprecated ``lower_bound`` / ``upper_bound`` kwargs ---
+    # Transparently convert to ``constraints=BoxConstraint(...)``.
+    if lower_bound is not None or upper_bound is not None:
+        import warnings as _warnings
+
+        if constraints is not None:
+            raise ValueError(
+                "minimize(): pass `constraints=` only — "
+                "`lower_bound` / `upper_bound` are deprecated and cannot be combined "
+                "with `constraints`."
+            )
+        _warnings.warn(
+            "`lower_bound` / `upper_bound` are deprecated in cadre.minimize(); "
+            "pass `constraints=BoxConstraint(lower=..., upper=...)` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Fill in unspecified side with ±inf of the right pytree shape.
+        if lower_bound is None:
+            lower_bound = jax.tree.map(lambda x: jnp.full_like(x, -jnp.inf), init_params)
+        if upper_bound is None:
+            upper_bound = jax.tree.map(lambda x: jnp.full_like(x, jnp.inf), init_params)
+        constraints = BoxConstraint(lower=lower_bound, upper=upper_bound)
+
+    # --- Constraint dispatch ---
+    # ``constraints`` is now the SOLE supported way to specify bounds / priors.
+    # Internal variables ``_lower_internal`` / ``_upper_internal`` are populated
+    # from a BoxConstraint and passed to the solver factories.
+    _lower_internal: PyTree[Float[Array, " P"]] | None = None
+    _upper_internal: PyTree[Float[Array, " P"]] | None = None
+    gaussian_prior: GaussianConstraint | None = None
+    if constraints is not None:
+        validate_constraint(constraints)
+        if isinstance(constraints, BoxConstraint):
+            _lower_internal = constraints.lower
+            _upper_internal = constraints.upper
+        elif isinstance(constraints, GaussianConstraint):
+            gaussian_prior = constraints
+        else:
+            raise TypeError(f"Unsupported constraint type: {type(constraints).__name__}")
+
+    # If a Gaussian prior is requested, wrap ``fn`` to include the prior log-
+    # likelihood so the optimizer and ``BestSoFarMinimiser`` track the joint
+    # MAP objective rather than just the data term.
+    if gaussian_prior is not None:
+        import jax.tree_util as _jtu
+
+        _gp = gaussian_prior
+        _orig_fn = fn
+
+        def fn(x, _orig=_orig_fn, _gp=_gp, **kw):  # type: ignore[no-redef]
+            data = _orig(x, **kw)
+            terms = _jtu.tree_map(
+                lambda v, loc, sc: jnp.sum(((v - loc) / sc) ** 2),
+                x,
+                _gp.loc,
+                _gp.scale,
+            )
+            prior = 0.5 * sum(_jtu.tree_leaves(terms))
+            return data + prior
 
     if solver_name in SELFCONDITIONED_SOLVERS and precondition:
         warning(f"Solver '{solver_name}' is self-conditioned; ignoring preconditioning request.")
@@ -265,30 +395,30 @@ def minimize(
     if precondition:
         fn, to_opt, from_opt = condition(
             fn,
-            lower=lower_bound,
-            upper=upper_bound,
+            lower=_lower_internal,
+            upper=_upper_internal,
             scale_function=precondition,
             init_params=init_params,
             **fn_kwargs,
         )
         init_params = to_opt(init_params)
-        lower_bound = to_opt(lower_bound) if lower_bound is not None else None
-        upper_bound = to_opt(upper_bound) if upper_bound is not None else None
+        _lower_internal = to_opt(_lower_internal) if _lower_internal is not None else None
+        _upper_internal = to_opt(_upper_internal) if _upper_internal is not None else None
     else:
         from_opt = lambda x: x
 
     _opts = options or {}
     cooldown = _opts.get("cooldown", 20)
-    min_steps = _opts.get("min_steps", 10)
-    solver_kwargs = {k: v for k, v in _opts.items() if k not in ("cooldown", "min_steps")}
+    solver_kwargs = {k: v for k, v in _opts.items() if k != "cooldown"}
+    if gaussian_prior is not None:
+        solver_kwargs.setdefault("gaussian_prior", gaussian_prior)
     solver, solver_type = get_solver(
         solver_name,
         rtol=rtol,
         atol=atol,
-        lower=lower_bound,
-        upper=upper_bound,
+        lower=_lower_internal,
+        upper=_upper_internal,
         cooldown=cooldown,
-        min_steps=min_steps,
         **solver_kwargs,
     )
 
@@ -335,11 +465,14 @@ def minimize(
             options["gtol"] = rtol
         elif method == "cobyqa":  # COBYQA
             options["final_tr_radius"] = atol
+        elif method == "trust-constr":
+            options["gtol"] = rtol
+            options["xtol"] = atol
         state = scipy_minimize(
             fn=fn,
             init_params=init_params,
-            lower_bound=lower_bound,
-            upper_bound=upper_bound,
+            lower_bound=_lower_internal,
+            upper_bound=_upper_internal,
             method=method,
             maxiter=max_iter,
             **fn_kwargs,

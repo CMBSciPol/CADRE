@@ -1,3 +1,11 @@
+"""Solver factory and dispatch table.
+
+This module wires together the public ``get_solver(name)`` interface. The
+active-set families (ADABK and LBFGSK) live in their own modules
+(:mod:`cadre.adabk` and :mod:`cadre.lbfgsk`); everything else in this file is
+either an off-the-shelf wrapper or a small bound-projection helper.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Literal, TypeAlias, Union
@@ -6,80 +14,20 @@ import jax
 import jax.numpy as jnp
 import optax
 import optimistix as optx
-from jaxtyping import Array, Bool, Float, PyTree
+from jaxtyping import Array, Float, PyTree
 from optax._src import combine, transform
 from optax._src import linesearch as _linesearch
 
-from .active_set import active_set
-
-# =============================================================================
-# OFF-THE-SHELF L-BFGS SOLVERS
-# =============================================================================
+from .active_set import ActiveSetMinimiser, active_set
+from .adabk import _reset_adabk_direction, make_adabk_solver
+from .lbfgsk import make_lbfgsk_solver
 
 Solver: TypeAlias = Union[optx.BestSoFarMinimiser, str]
 
 
-class ActiveSetMinimiser(optx.OptaxMinimiser):
-    cooldown_steps: int
-    min_steps: int
-    verbose_print: bool
-
-    def __init__(
-        self, optim, atol, rtol, cooldown_steps=20, min_steps=200, verbose_print=False, **kwargs
-    ):
-        super().__init__(optim, atol=atol, rtol=rtol, **kwargs)
-        self.cooldown_steps = cooldown_steps
-        self.min_steps = min_steps
-        self.verbose_print = verbose_print
-
-    def terminate(
-        self,
-        fn: Any,
-        y: PyTree,
-        args: PyTree,
-        options: dict[str, Any],
-        state: Any,
-        tags: frozenset[object],
-    ) -> tuple[Bool[Array, ""], optx.RESULTS]:
-        del fn, args, options
-        ast = state.opt_state  # ActiveSetState
-
-        # Robust f-check: scale by best_f, not current f (spike-immune)
-        scale = jnp.maximum(1.0, jnp.abs(ast.best_f))
-        f_diff = jnp.abs(ast.f_val - ast.prev_f)
-        f_converged = f_diff < self.atol + self.rtol * scale
-
-        # Require BOTH robust f-check AND cauchy y-space convergence
-        converged = f_converged & state.terminate
-
-        # Override: don't terminate before min_steps
-        too_early = ast.count < self.min_steps
-        # Override: don't terminate during cooldown after a constraint release
-        # (last_release_step == -1 means no release has happened yet)
-        steps_since_release = ast.count - ast.last_release_step
-        in_cooldown = (ast.last_release_step >= 0) & (steps_since_release < self.cooldown_steps)
-        override = ast.constraints_released | in_cooldown | too_early
-
-        terminate = jnp.where(override, False, converged)
-
-        if self.verbose_print:
-            jax.debug.print(
-                "step={s} | f={f:.4e} best_f={bf:.4e} f_diff={fd:.4e} scale={sc:.4e} | "
-                "f_conv={fc} cooldown={cd} too_early={te} released={rel} cauchy={cau} => terminate={t}",
-                s=ast.count,
-                f=ast.f_val,
-                bf=ast.best_f,
-                fd=f_diff,
-                sc=scale,
-                fc=f_converged,
-                cd=in_cooldown,
-                te=too_early,
-                rel=ast.constraints_released,
-                cau=state.terminate,
-                t=terminate,
-            )
-
-        return terminate, optx.RESULTS.successful
+# =============================================================================
+# OFF-THE-SHELF L-BFGS factories (kept for use by furax-cs and `optax_lbfgs`)
+# =============================================================================
 
 
 def lbfgs_zoom(
@@ -94,28 +42,7 @@ def lbfgs_zoom(
     lower: PyTree[Float[Array, " P"]] | None = None,
     upper: PyTree[Float[Array, " P"]] | None = None,
 ) -> optax.GradientTransformation:
-    """L-BFGS with zoom linesearch (strong Wolfe conditions).
-
-    This is the standard L-BFGS with zoom linesearch that enforces both:
-    - Sufficient decrease (Armijo): f(x + η*d) ≤ f(x) + c1*η*∇f(x)ᵀd
-    - Curvature condition: |∇f(x + η*d)ᵀd| ≤ c2*|∇f(x)ᵀd|
-
-    Args:
-        learning_rate: Optional global scaling factor.
-        memory_size: Number of past updates for Hessian approximation.
-        scale_init_precond: Whether to scale initial Hessian approximation.
-            WARNING: Set to False for numerically sensitive problems.
-        max_linesearch_steps: Maximum iterations for zoom linesearch.
-        initial_guess_strategy: "one" (start at η=1) or "keep" (use previous).
-        slope_rtol: c1 parameter for Armijo condition (default 1e-4).
-        curv_rtol: c2 parameter for curvature condition (default 0.9).
-        verbose: Print linesearch debugging info.
-        lower: Optional lower bounds for box projection (pytree).
-        upper: Optional upper bounds for box projection (pytree).
-
-    Returns:
-        An optax GradientTransformation.
-    """
+    """L-BFGS with zoom linesearch (strong Wolfe conditions)."""
     if learning_rate is None:
         base_scaling = transform.scale(-1.0)
     else:
@@ -138,7 +65,6 @@ def lbfgs_zoom(
         linesearch,
     ]
 
-    # Add projection if bounds provided
     if lower is not None and upper is not None:
         chain_components.append(apply_projection(lower, upper))
 
@@ -158,28 +84,7 @@ def lbfgs_backtrack(
     lower: PyTree[Float[Array, " P"]] | None = None,
     upper: PyTree[Float[Array, " P"]] | None = None,
 ) -> optax.GradientTransformation:
-    """L-BFGS with backtracking linesearch (Armijo condition only).
-
-    Simpler than zoom linesearch, only enforces sufficient decrease:
-    - Armijo: f(x + η*d) ≤ f(x) + c1*η*∇f(x)ᵀd
-
-    Args:
-        learning_rate: Optional global scaling factor.
-        memory_size: Number of past updates for Hessian approximation.
-        scale_init_precond: Whether to scale initial Hessian approximation.
-            WARNING: Set to False for numerically sensitive problems.
-        max_backtracking_steps: Maximum backtracking iterations.
-        slope_rtol: c1 parameter for Armijo condition (default 1e-4).
-        decrease_factor: Multiply stepsize by this when condition fails (default 0.8).
-        increase_factor: Initial guess = previous * this factor (default 1.5).
-        max_learning_rate: Upper bound on stepsize (default 1.0).
-        verbose: Print linesearch debugging info.
-        lower: Optional lower bounds for box projection (pytree).
-        upper: Optional upper bounds for box projection (pytree).
-
-    Returns:
-        An optax GradientTransformation.
-    """
+    """L-BFGS with backtracking linesearch (Armijo condition only)."""
     if learning_rate is None:
         base_scaling = transform.scale(-1.0)
     else:
@@ -203,39 +108,6 @@ def lbfgs_backtrack(
         linesearch,
     ]
 
-    # Add projection if bounds provided
-    if lower is not None and upper is not None:
-        chain_components.append(apply_projection(lower, upper))
-
-    return combine.chain(*chain_components)
-
-
-def backtracking_adam(
-    max_backtracking_steps: int = 200,
-    slope_rtol: float = 1e-4,
-    decrease_factor: float = 0.8,
-    increase_factor: float = 1.5,
-    max_learning_rate: float = 1.0,
-    verbose: bool = False,
-    lower: PyTree[Float[Array, " P"]] | None = None,
-    upper: PyTree[Float[Array, " P"]] | None = None,
-) -> optax.GradientTransformation:
-    """Adam with backtracking linesearch (Armijo condition only)."""
-    linesearch = _linesearch.scale_by_backtracking_linesearch(
-        max_backtracking_steps=max_backtracking_steps,
-        slope_rtol=slope_rtol,
-        decrease_factor=decrease_factor,
-        increase_factor=increase_factor,
-        max_learning_rate=max_learning_rate,
-        verbose=verbose,
-    )
-
-    chain_components = [
-        optax.adam(learning_rate=1.0),  # Learning rate handled by linesearch
-        linesearch,
-    ]
-
-    # Add projection if bounds provided
     if lower is not None and upper is not None:
         chain_components.append(apply_projection(lower, upper))
 
@@ -253,21 +125,8 @@ def apply_projection(
 ) -> optax.GradientTransformation:
     """Wrap box projection into a GradientTransformation.
 
-    After applying this transformation, params + updates will be within [lower, upper].
-    The update rule: u_new = clip(p + u, lower, upper) - p
-
-    This can be chained with optimizers like:
-        optimizer = optax.chain(
-            optax.adam(learning_rate=1e-3),
-            apply_projection(lower={'w': 0.0}, upper={'w': 1.0})
-        )
-
-    Args:
-        lower: Lower bounds (pytree matching params structure)
-        upper: Upper bounds (pytree matching params structure)
-
-    Returns:
-        GradientTransformation that projects updates to keep params in bounds.
+    After applying this transformation, ``params + updates`` will be clipped to
+    ``[lower, upper]`` element-wise.
     """
 
     def init_fn(params: PyTree[Float[Array, " P"]]) -> optax.EmptyState:
@@ -280,25 +139,17 @@ def apply_projection(
         params: PyTree[Float[Array, " P"]] | None = None,
     ) -> tuple[PyTree[Float[Array, " P"]], optax.EmptyState]:
         if params is None:
-            raise ValueError("NO_PARAMS_MSG")
+            raise ValueError("apply_projection requires `params=` to be passed in update()")
 
         if lower is None or upper is None:
             return updates, state
 
-        def process_leaf(
-            p: Float[Array, " P"],
-            u: Float[Array, " P"],
-            lo: Float[Array, " P"],
-            hi: Float[Array, " P"],
-        ) -> Float[Array, " P"]:
+        def process_leaf(p, u, lo, hi):
             if p is None or u is None:
                 return u
-            tentative = p + u
-            projected = jnp.clip(tentative, lo, hi)
-            return projected - p
+            return jnp.clip(p + u, lo, hi) - p
 
-        new_updates = jax.tree.map(process_leaf, params, updates, lower, upper)
-        return new_updates, state
+        return jax.tree.map(process_leaf, params, updates, lower, upper), state
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -310,33 +161,36 @@ def apply_projection(
 SOLVER_NAMES = Literal[
     # Optax L-BFGS (jax_grid_search compatible)
     "optax_lbfgs",
-    "optax_lbfgs",
     "adam",
     "sgd",
     "adabelief",
     "adaw",
+    # Active set families
     "active_set",
     "active_set_sgd",
     "active_set_adabelief",
     "active_set_adaw",
-    # Optimistix BFGS
-    "optimistix_bfgs",
-    # Optimistix L-BFGS
-    "optimistix_lbfgs",
-    # Optimistix NCG (Armijo)
-    "optimistix_ncg_pr",
-    "optimistix_ncg_hs",
-    "optimistix_ncg_fr",
-    "optimistix_ncg_dy",
     # Scipy
     "scipy_tnc",
     "scipy_cobyqa",
-    # Legacy aliases
-    "zoom",
-    "backtrack",
 ]
 
-SELFCONDITIONED_SOLVERS = {"active_set", "active_set_sgd", "scipy_tnc", "scipy_cobyqa"}
+SELFCONDITIONED_SOLVERS = {
+    "active_set",
+    "active_set_sgd",
+    "active_set_adabelief",
+    "active_set_adaw",
+    "scipy_tnc",
+    "scipy_cobyqa",
+}
+
+
+def _is_adabk(name: str) -> bool:
+    return name == "active_set_adabelief" or name.startswith("ADABK")
+
+
+def _is_lbfgsk(name: str) -> bool:
+    return name.startswith("LBFGSK")
 
 
 def get_solver(
@@ -348,51 +202,69 @@ def get_solver(
     lower: PyTree[Float[Array, " P"]] | None = None,
     upper: PyTree[Float[Array, " P"]] | None = None,
     verbose_print: bool = False,
-    min_steps: int = 10,
     cooldown: int = 20,
     **kwargs: Any,
 ) -> tuple[Solver, Literal["optimistix", "scipy"]]:
-    """
-    Create a solver instance from a name string.
+    """Create a solver instance from a name string.
 
-    Parameters
-    ----------
-    solver_name : str
-        Solver identifier. See SOLVER_NAMES for available options.
-    rtol : float
-        Relative tolerance for optimistix solvers.
-    atol : float
-        Absolute tolerance for optimistix solvers.
-    learning_rate : float
-        Learning rate for adam solver.
-    max_linesearch_steps : int
-        Maximum linesearch steps for L-BFGS solvers.
-    lower : PyTree, optional
-        Lower bounds for box projection (optax solvers only).
-    upper : PyTree, optional
-        Upper bounds for box projection (optax solvers only).
-    verbose_print : bool
-        If True, print per-step termination diagnostics for active-set
-        solvers via ``jax.debug.print`` (JIT-compatible).
-    min_steps : int
-        Minimum iterations before termination is considered
-        (active-set solvers only).
-    cooldown : int
-        Steps to suppress termination after a constraint release
-        (active-set solvers only).
-    max_linesearch_steps : int
-        Maximum line-search steps per iteration (active-set and
-        ``optax_lbfgs`` solvers).
+    The ``ADABK{N}`` and ``LBFGSK{N}`` families dispatch via prefix to
+    :func:`cadre.adabk.make_adabk_solver` and
+    :func:`cadre.lbfgsk.make_lbfgsk_solver`. The trailing integer ``N`` is
+    parsed as the release fraction ``N × 0.1`` (``ADABK0`` / ``LBFGSK0``
+    release one constraint at a time).
 
-    Returns
-    -------
-    solver : Solver can be either a BestSoFar wrapped minimiser or a string for scipy.
-        The solver instance.
-    solver_type : str
-        One of "optimistix", "scipy".
+    Active-set-only kwargs (``gaussian_prior``, ``noise_temperature``,
+    ``noise_decay``, ``noise_key``) are consumed up-front so they never reach
+    non-active-set solver factories.
+
+    Self-conditioned solvers (see :data:`SELFCONDITIONED_SOLVERS`) handle
+    their own parameter scaling — the unified ``minimize()`` wrapper skips
+    its ``precondition`` step for them.
     """
-    # Resolve aliases
-    # Optax solvers (with optional box projection)
+    # Consume active-set-only kwargs up-front.
+    gaussian_prior = kwargs.pop("gaussian_prior", None)
+    noise_temperature = kwargs.pop("noise_temperature", 0.0)
+    noise_decay = kwargs.pop("noise_decay", 1e-3)
+    noise_key = kwargs.pop("noise_key", 0)
+
+    active_set_extras = dict(
+        gaussian_prior=gaussian_prior,
+        noise_temperature=noise_temperature,
+        noise_decay=noise_decay,
+        noise_key=noise_key,
+    )
+
+    # ---- ADABK family ----
+    if _is_adabk(solver_name):
+        return make_adabk_solver(
+            solver_name,
+            rtol=rtol,
+            atol=atol,
+            max_linesearch_steps=max_linesearch_steps,
+            lower=lower,
+            upper=upper,
+            verbose_print=verbose_print,
+            cooldown=cooldown,
+            active_set_extras=active_set_extras,
+            **kwargs,
+        ), "optimistix"
+
+    # ---- LBFGSK family ----
+    if _is_lbfgsk(solver_name):
+        return make_lbfgsk_solver(
+            solver_name,
+            rtol=rtol,
+            atol=atol,
+            max_linesearch_steps=max_linesearch_steps,
+            lower=lower,
+            upper=upper,
+            verbose_print=verbose_print,
+            cooldown=cooldown,
+            active_set_extras=active_set_extras,
+            **kwargs,
+        ), "optimistix"
+
+    # ---- Off-the-shelf optax_lbfgs ----
     if solver_name == "optax_lbfgs":
         linesearch_type = kwargs.pop("linesearch", "zoom")
         if linesearch_type == "zoom":
@@ -408,7 +280,7 @@ def get_solver(
                     rtol=rtol,
                 )
             ), "optimistix"
-        elif linesearch_type == "backtracking":
+        if linesearch_type == "backtracking":
             return optx.BestSoFarMinimiser(
                 optx.OptaxMinimiser(
                     lbfgs_backtrack(
@@ -421,13 +293,12 @@ def get_solver(
                     rtol=rtol,
                 )
             ), "optimistix"
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-    elif solver_name == "adam":
-        # Chain adam with projection if bounds provided
-        # learning_rate from kwargs takes precedence over function parameter
+        raise ValueError(
+            f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
+        )
+
+    # ---- First-order optax solvers (adam / sgd / adabelief / adaw) ----
+    if solver_name == "adam":
         lr = kwargs.pop("learning_rate", learning_rate)
         adam_opt = optax.adam(learning_rate=lr, **kwargs)
         if lower is not None and upper is not None:
@@ -435,12 +306,9 @@ def get_solver(
         return optx.BestSoFarMinimiser(
             optx.OptaxMinimiser(adam_opt, atol=atol, rtol=rtol)
         ), "optimistix"
-    elif solver_name == "sgd":
-        # Chain sgd with projection if bounds provided
-        # learning_rate from kwargs takes precedence (default 1.0 for linesearch use)
+    if solver_name == "sgd":
         lr = kwargs.pop("learning_rate", 1.0)
         direction = optax.sgd(learning_rate=lr)
-        # Keep your line search
         linesearch = _linesearch.scale_by_backtracking_linesearch(
             max_backtracking_steps=max_linesearch_steps
         )
@@ -451,62 +319,33 @@ def get_solver(
         return optx.BestSoFarMinimiser(
             optx.OptaxMinimiser(sgd_opt, atol=atol, rtol=rtol)
         ), "optimistix"
-    elif solver_name == "adabelief":
+    if solver_name == "adabelief":
         lr = kwargs.pop("learning_rate", learning_rate)
         opt = optax.adabelief(learning_rate=lr)
         if lower is not None and upper is not None:
             opt = combine.chain(opt, apply_projection(lower, upper))
         return optx.BestSoFarMinimiser(optx.OptaxMinimiser(opt, atol=atol, rtol=rtol)), "optimistix"
-    elif solver_name == "adaw" or solver_name == "adamw":
+    if solver_name in ("adaw", "adamw"):
         lr = kwargs.pop("learning_rate", learning_rate)
         opt = optax.adamw(learning_rate=lr, **kwargs)
         if lower is not None and upper is not None:
             opt = combine.chain(opt, apply_projection(lower, upper))
         return optx.BestSoFarMinimiser(optx.OptaxMinimiser(opt, atol=atol, rtol=rtol)), "optimistix"
-    elif solver_name == "active_set":
-        # Default configuration for active set: Adam + configurable linesearch
-        # Extract learning_rate and linesearch options
+
+    # ---- Custom-direction active-set variants (Adam / SGD / AdamW) ----
+    if solver_name in ("active_set", "active_set_sgd", "active_set_adaw"):
         lr = kwargs.pop("learning_rate", 1.0)
         linesearch_type = kwargs.pop("linesearch", "backtracking")
 
-        direction = optax.adam(learning_rate=lr)
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                min_steps=min_steps,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
-        ), "optimistix"
-    elif solver_name == "active_set_sgd":
-        # Default configuration for active set SGD: SGD + configurable linesearch
-        # Extract learning_rate and linesearch options
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "backtracking")
-
-        direction = optax.sgd(learning_rate=lr)
+        if solver_name == "active_set":
+            direction = optax.adam(learning_rate=lr)
+            reset_fn = _reset_adabk_direction  # Adam state mu/nu shape matches AdaBelief.
+        elif solver_name == "active_set_sgd":
+            direction = optax.sgd(learning_rate=lr)
+            reset_fn = None
+        else:  # active_set_adaw
+            direction = optax.adamw(learning_rate=lr)
+            reset_fn = None
 
         if linesearch_type == "backtracking":
             linesearch = _linesearch.scale_by_backtracking_linesearch(
@@ -528,128 +367,26 @@ def get_solver(
                     linesearch,
                     lower=lower,
                     upper=upper,
+                    reset_direction_fn=reset_fn,
                     verbose_print=verbose_print,
+                    **active_set_extras,
                     **kwargs,
                 ),
                 atol=atol,
                 rtol=rtol,
-                min_steps=min_steps,
                 cooldown_steps=cooldown,
                 verbose_print=verbose_print,
             )
         ), "optimistix"
-    elif solver_name == "active_set_adabelief" or solver_name.startswith("ADABK"):
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "zoom")
-        max_constraints_to_release = kwargs.pop("max_constraints_to_release", None)
-        if max_constraints_to_release is None:
-            # check int in ADABKN as in ADABK5 for example
-            if solver_name.startswith("ADABK") and len(solver_name) > 5:
-                try:
-                    max_constraints_to_release = int(solver_name[5:]) * 0.1
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid solver name: {solver_name}. "
-                        f"When using 'ADABK' prefix, it should be followed by an integer."
-                    )
 
-        direction = optax.adabelief(learning_rate=lr)
-
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    max_constraints_to_release=max_constraints_to_release,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                min_steps=min_steps,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
-        ), "optimistix"
-    elif solver_name == "active_set_adaw":
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "backtracking")
-
-        direction = optax.adamw(learning_rate=lr)
-
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                min_steps=min_steps,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
-        ), "optimistix"
-    # Optimistix BFGS
-    elif solver_name == "optimistix_bfgs":
-        return optx.BestSoFarMinimiser(optx.BFGS(rtol=rtol, atol=atol, **kwargs)), "optimistix"
-    # Optimistix L-BFGS
-    elif solver_name == "optimistix_lbfgs":
-        return optx.BestSoFarMinimiser(optx.LBFGS(rtol=rtol, atol=atol, **kwargs)), "optimistix"
-    # Optimistix NCG (Armijo)
-    elif solver_name == "optimistix_ncg_pr":
-        return optx.BestSoFarMinimiser(
-            optx.NonlinearCG(rtol=rtol, atol=atol, method=optx.polak_ribiere, **kwargs)
-        ), "optimistix"
-    elif solver_name == "optimistix_ncg_hs":
-        return optx.BestSoFarMinimiser(
-            optx.NonlinearCG(rtol=rtol, atol=atol, method=optx.hestenes_stiefel, **kwargs)
-        ), "optimistix"
-    elif solver_name == "optimistix_ncg_fr":
-        return optx.BestSoFarMinimiser(
-            optx.NonlinearCG(rtol=rtol, atol=atol, method=optx.fletcher_reeves, **kwargs)
-        ), "optimistix"
-    elif solver_name == "optimistix_ncg_dy":
-        return optx.BestSoFarMinimiser(
-            optx.NonlinearCG(rtol=rtol, atol=atol, method=optx.dai_yuan, **kwargs)
-        ), "optimistix"
-    # Scipy (returns string — handled by minimize() via scipy_minimize)
-    elif solver_name == "scipy_tnc":
+    # ---- Scipy backends ----
+    if solver_name == "scipy_tnc":
         return "scipy_tnc", "scipy"
-    elif solver_name == "scipy_cobyqa":
+    if solver_name == "scipy_cobyqa":
         return "scipy_cobyqa", "scipy"
+    if solver_name == "scipy_lbfgsb":
+        return "scipy_lbfgsb", "scipy"
+    if solver_name == "scipy_trust-constr":
+        return "scipy_trust-constr", "scipy"
 
-    else:
-        raise ValueError(f"Unknown solver: {solver_name}. Available: {list(SOLVER_NAMES.__args__)}")
+    raise ValueError(f"Unknown solver: {solver_name}. Available: {list(SOLVER_NAMES.__args__)}")

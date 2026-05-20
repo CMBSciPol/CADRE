@@ -1,15 +1,18 @@
 """CADRE — Constraint-Aware Descent Routine Executor.
 
 A JAX-native optimization library providing:
-- Active-set constrained optimization (ADABK family)
-- L-BFGS with zoom/backtracking linesearch
+- Active-set constrained optimization (ADABK and LBFGSK families)
+- L-BFGS with zoom/backtracking linesearch (off-the-shelf)
 - Unified interface to optax, optimistix, and scipy solvers
-- Parameter conditioning and box projection utilities
+- Parameter conditioning, box projection, and Gaussian-prior utilities
 """
 
 from importlib import metadata
 
-from .active_set import ActiveSetState, active_set
+from .active_set import ActiveSetMinimiser, ActiveSetState, active_set
+from .adabk import make_adabk_solver
+from .constraints import BoxConstraint, Constraint, GaussianConstraint, validate_constraint
+from .lbfgsk import make_lbfgsk_solver
 from .minimize import ScipyMinimizeState, UnifiedState, minimize, scipy_minimize
 from .solvers import (
     SELFCONDITIONED_SOLVERS,
@@ -25,6 +28,10 @@ __all__ = [
     # Core optimizer
     "active_set",
     "ActiveSetState",
+    "ActiveSetMinimiser",
+    # ADABK / LBFGSK families
+    "make_adabk_solver",
+    "make_lbfgsk_solver",
     # Unified interface
     "minimize",
     "scipy_minimize",
@@ -37,6 +44,11 @@ __all__ = [
     # L-BFGS variants
     "lbfgs_zoom",
     "lbfgs_backtrack",
+    # Constraints
+    "BoxConstraint",
+    "GaussianConstraint",
+    "Constraint",
+    "validate_constraint",
     # Utilities
     "apply_projection",
     "condition",
