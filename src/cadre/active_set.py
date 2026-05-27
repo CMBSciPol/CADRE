@@ -275,7 +275,7 @@ def active_set(
         if max_constraints_to_release is None:
             k_val = max(1, total_params // 10)
         elif isinstance(max_constraints_to_release, float):
-            k_val = max(1, int(total_params * max_constraints_to_release))
+            k_val = min(total_params, max(1, int(total_params * max_constraints_to_release)))
         else:
             k_val = min(max_constraints_to_release, total_params)
             k_val = max(1, k_val)
