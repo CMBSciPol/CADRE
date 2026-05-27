@@ -6,80 +6,17 @@ import jax
 import jax.numpy as jnp
 import optax
 import optimistix as optx
-from jaxtyping import Array, Bool, Float, PyTree
+from jaxtyping import Array, Float, PyTree
 from optax._src import combine, transform
 from optax._src import linesearch as _linesearch
 
-from .active_set import active_set
+from .active_set import ActiveSetMinimiser, active_set, make_adabk_solver
 
 # =============================================================================
 # OFF-THE-SHELF L-BFGS SOLVERS
 # =============================================================================
 
 Solver: TypeAlias = Union[optx.BestSoFarMinimiser, str]
-
-
-class ActiveSetMinimiser(optx.OptaxMinimiser):
-    cooldown_steps: int
-    min_steps: int
-    verbose_print: bool
-
-    def __init__(
-        self, optim, atol, rtol, cooldown_steps=20, min_steps=200, verbose_print=False, **kwargs
-    ):
-        super().__init__(optim, atol=atol, rtol=rtol, **kwargs)
-        self.cooldown_steps = cooldown_steps
-        self.min_steps = min_steps
-        self.verbose_print = verbose_print
-
-    def terminate(
-        self,
-        fn: Any,
-        y: PyTree,
-        args: PyTree,
-        options: dict[str, Any],
-        state: Any,
-        tags: frozenset[object],
-    ) -> tuple[Bool[Array, ""], optx.RESULTS]:
-        del fn, args, options
-        ast = state.opt_state  # ActiveSetState
-
-        # Robust f-check: scale by best_f, not current f (spike-immune)
-        scale = jnp.maximum(1.0, jnp.abs(ast.best_f))
-        f_diff = jnp.abs(ast.f_val - ast.prev_f)
-        f_converged = f_diff < self.atol + self.rtol * scale
-
-        # Require BOTH robust f-check AND cauchy y-space convergence
-        converged = f_converged & state.terminate
-
-        # Override: don't terminate before min_steps
-        too_early = ast.count < self.min_steps
-        # Override: don't terminate during cooldown after a constraint release
-        # (last_release_step == -1 means no release has happened yet)
-        steps_since_release = ast.count - ast.last_release_step
-        in_cooldown = (ast.last_release_step >= 0) & (steps_since_release < self.cooldown_steps)
-        override = ast.constraints_released | in_cooldown | too_early
-
-        terminate = jnp.where(override, False, converged)
-
-        if self.verbose_print:
-            jax.debug.print(
-                "step={s} | f={f:.4e} best_f={bf:.4e} f_diff={fd:.4e} scale={sc:.4e} | "
-                "f_conv={fc} cooldown={cd} too_early={te} released={rel} cauchy={cau} => terminate={t}",
-                s=ast.count,
-                f=ast.f_val,
-                bf=ast.best_f,
-                fd=f_diff,
-                sc=scale,
-                fc=f_converged,
-                cd=in_cooldown,
-                te=too_early,
-                rel=ast.constraints_released,
-                cau=state.terminate,
-                t=terminate,
-            )
-
-        return terminate, optx.RESULTS.successful
 
 
 def lbfgs_zoom(
@@ -348,7 +285,6 @@ def get_solver(
     lower: PyTree[Float[Array, " P"]] | None = None,
     upper: PyTree[Float[Array, " P"]] | None = None,
     verbose_print: bool = False,
-    min_steps: int = 10,
     cooldown: int = 20,
     **kwargs: Any,
 ) -> tuple[Solver, Literal["optimistix", "scipy"]]:
@@ -374,9 +310,6 @@ def get_solver(
     verbose_print : bool
         If True, print per-step termination diagnostics for active-set
         solvers via ``jax.debug.print`` (JIT-compatible).
-    min_steps : int
-        Minimum iterations before termination is considered
-        (active-set solvers only).
     cooldown : int
         Steps to suppress termination after a constraint release
         (active-set solvers only).
@@ -495,7 +428,6 @@ def get_solver(
                 ),
                 atol=atol,
                 rtol=rtol,
-                min_steps=min_steps,
                 cooldown_steps=cooldown,
                 verbose_print=verbose_print,
             )
@@ -533,58 +465,21 @@ def get_solver(
                 ),
                 atol=atol,
                 rtol=rtol,
-                min_steps=min_steps,
                 cooldown_steps=cooldown,
                 verbose_print=verbose_print,
             )
         ), "optimistix"
     elif solver_name == "active_set_adabelief" or solver_name.startswith("ADABK"):
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "zoom")
-        max_constraints_to_release = kwargs.pop("max_constraints_to_release", None)
-        if max_constraints_to_release is None:
-            # check int in ADABKN as in ADABK5 for example
-            if solver_name.startswith("ADABK") and len(solver_name) > 5:
-                try:
-                    max_constraints_to_release = int(solver_name[5:]) * 0.1
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid solver name: {solver_name}. "
-                        f"When using 'ADABK' prefix, it should be followed by an integer."
-                    )
-
-        direction = optax.adabelief(learning_rate=lr)
-
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    max_constraints_to_release=max_constraints_to_release,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                min_steps=min_steps,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
+        return make_adabk_solver(
+            solver_name,
+            rtol=rtol,
+            atol=atol,
+            max_linesearch_steps=max_linesearch_steps,
+            lower=lower,
+            upper=upper,
+            verbose_print=verbose_print,
+            cooldown=cooldown,
+            **kwargs,
         ), "optimistix"
     elif solver_name == "active_set_adaw":
         lr = kwargs.pop("learning_rate", 1.0)
@@ -617,7 +512,6 @@ def get_solver(
                 ),
                 atol=atol,
                 rtol=rtol,
-                min_steps=min_steps,
                 cooldown_steps=cooldown,
                 verbose_print=verbose_print,
             )

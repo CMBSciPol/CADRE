@@ -238,8 +238,6 @@ def minimize(
 
         * ``cooldown`` (int, default 20) — steps to suppress termination
           after a constraint release.
-        * ``min_steps`` (int, default 10) — minimum iterations before
-          termination is considered.
         * ``verbose_print`` (bool, default False) — print per-step debug
           info via ``jax.debug.print`` (JIT-compatible).
         * ``max_linesearch_steps`` (int, default 50) — maximum line-search
@@ -279,8 +277,7 @@ def minimize(
 
     _opts = options or {}
     cooldown = _opts.get("cooldown", 20)
-    min_steps = _opts.get("min_steps", 10)
-    solver_kwargs = {k: v for k, v in _opts.items() if k not in ("cooldown", "min_steps")}
+    solver_kwargs = {k: v for k, v in _opts.items() if k != "cooldown"}
     solver, solver_type = get_solver(
         solver_name,
         rtol=rtol,
@@ -288,7 +285,6 @@ def minimize(
         lower=lower_bound,
         upper=upper_bound,
         cooldown=cooldown,
-        min_steps=min_steps,
         **solver_kwargs,
     )
 

@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 import optax.tree_utils as otu
+import optimistix as optx
 from jax.flatten_util import ravel_pytree
 from jaxtyping import (
     Array,
@@ -18,6 +19,7 @@ from jaxtyping import (
     PyTree,  # pyright: ignore
     Scalar,
 )
+from optax._src import linesearch as _linesearch
 
 from ._logging import info
 
@@ -41,8 +43,6 @@ def _compute_initial_pivot(
         off: Float[Array, " P"],
     ) -> Int[Array, " P"]:
         EPS = 1e-8  # Slightly relaxed tolerance for float32/64 stability
-        # Calculate physical bounds tolerance
-        # Handle inf: if lo is -inf, tol doesn't matter as we check bounds later
         tol_lower = EPS * 10.0 * (jnp.abs(lo) + 1.0)
         tol_upper = EPS * 10.0 * (jnp.abs(up) + 1.0)
 
@@ -88,32 +88,23 @@ def _compute_step_max(
         sc: Float[Array, " P"],
         off: Float[Array, " P"],
     ) -> Float[Array, " P"]:
-        # Only check bounds if we are moving towards them
-
         # Internal bounds
         lo_int = (lo - off) / jnp.where(sc == 0, 1.0, sc)
         up_int = (up - off) / jnp.where(sc == 0, 1.0, sc)
 
-        # If d < 0, we worry about lower bound
-        # alpha * d >= lo_int - y  =>  alpha <= (lo_int - y) / d  (flip sign)
         t_lower = jnp.where(d_leaf < -1e-12, (lo_int - y_leaf) / d_leaf, jnp.inf)
-
-        # If d > 0, we worry about upper bound
-        # alpha * d <= up_int - y  => alpha <= (up_int - y) / d
         t_upper = jnp.where(d_leaf > 1e-12, (up_int - y_leaf) / d_leaf, jnp.inf)
 
         return jnp.minimum(t_lower, t_upper)
 
     max_steps = jtu.tree_map(_leaf_step, y_int, direction, pivot, lower, upper, scale, offset)
 
-    # Global minimum step across all parameters
     flat_steps = jtu.tree_leaves(max_steps)
     if not flat_steps:
         return step_limit
 
     dist_to_bound = jnp.min(jnp.stack([jnp.min(s) for s in flat_steps]))
 
-    # We take the smaller of the proposed step limit or the distance to bound
     return jnp.minimum(step_limit, dist_to_bound)
 
 
@@ -138,7 +129,6 @@ def _update_pivot_at_boundary(
         sc: Float[Array, " P"],
         off: Float[Array, " P"],
     ) -> Int[Array, " P"]:
-        # Predict where we landed
         y_next = y_leaf + step_size * d_leaf
         y_next_phys = y_next * sc + off
 
@@ -146,12 +136,8 @@ def _update_pivot_at_boundary(
         tol_lower = EPS * 10.0 * (jnp.abs(lo) + 1.0)
         tol_upper = EPS * 10.0 * (jnp.abs(up) + 1.0)
 
-        # If we were free (0) and now hit bound, update
         is_free = p_leaf == 0
-
-        # Check if we hit lower
         hits_lower = is_free & (d_leaf < 0) & (y_next_phys - lo <= tol_lower)
-        # Check if we hit upper
         hits_upper = is_free & (d_leaf > 0) & (up - y_next_phys <= tol_upper)
 
         new_p = p_leaf
@@ -172,31 +158,12 @@ def _update_pivot_at_boundary(
 
 
 def _tree_top_k(tree: PyTree, k: int) -> PyTree:
-    """
-    Finds the indices of the top K largest values across an entire PyTree.
-
-    Returns:
-        A PyTree of the same structure as input, containing boolean masks.
-        True indicates the leaf value at that position is among the global top K.
-    """
-    # 1. Flatten the entire tree into a single 1D array
+    """Find boolean mask of the top K largest values across an entire PyTree."""
     flat_data, unravel_fn = ravel_pytree(tree)
-
-    # 2. Handle edge case where k > total elements
     n_params = flat_data.shape[0]
-
-    # 3. Find Top-K indices on the flat array
-    # values: the top k values
-    # indices: the flat indices of those values
     _, top_indices = jax.lax.top_k(flat_data, k)
-
-    # 4. Create a flat boolean mask
-    # Initialize all False
     flat_mask = jnp.zeros(n_params, dtype=bool)
-    # Set the top-k positions to True
     flat_mask = flat_mask.at[top_indices].set(True)
-
-    # 5. Unravel the flat mask back into the original PyTree structure
     return unravel_fn(flat_mask)
 
 
@@ -205,38 +172,26 @@ def _release_constraints(
     gradients_int: PyTree[Float[Array, " P"]],
     max_release_k: int,
 ) -> tuple[PyTree[Int[Array, " P"]], Bool[Array, ""]]:
-    """
-    Release constraints if the negative gradient points into the feasible region.
-    TNC checks: if pivot=-1 (at lower) and -grad > 0 (descent direction is up), release.
+    """Release constraints if the negative gradient points into the feasible region.
 
-    This version uses a "score" (pivot * grad) and only releases the top-k
-    constraints with the highest positive score (strongest desire to release).
+    Score = pivot * gradient. Releases the Top-K active constraints with the
+    strongest positive score (strongest desire to release).
+
+    References:
+        Kabalan et al. (2025), arXiv:2604.08463 — AdaTopK active-set release rule
     """
 
     def _compute_score(p: Int[Array, " P"], g: Float[Array, " P"]) -> Float[Array, " P"]:
-        # descent direction is -g
-        # Score = pivot * gradient
-        # If at lower bound (p=-1), we release if -g > 0 => g < 0. Score = (-1)*(-ve) = +ve
-        # If at upper bound (p=1),  we release if -g < 0 => g > 0. Score = (1)*(+ve)  = +ve
-
-        # We only care about active constraints (abs(p) == 1)
-        # We mask out non-active constraints (0 or 2) with -inf
         score = p * g
         return jnp.where(jnp.abs(p) == 1, score, -jnp.inf)
 
-    # 1. Calculate scores for all parameters
     scores = jtu.tree_map(_compute_score, pivot, gradients_int)
 
-    # Check if any constraint wants to be released
     flat_scores, _ = ravel_pytree(scores)
     constraints_released = jnp.any(flat_scores > 0)
 
-    # 2. Find the mask for the Top-K scores globally
     top_k_mask = _tree_top_k(scores, max_release_k)
 
-    # 3. Determine actual release mask:
-    #    - Must be in Top K
-    #    - Must have a positive score (gradient actually points inward)
     def _apply_release(
         p: Int[Array, " P"], is_top_k: Bool[Array, " P"], s: Float[Array, " P"]
     ) -> Int[Array, " P"]:
@@ -248,9 +203,9 @@ def _release_constraints(
 
 # --- Active Set Component ---
 def _rescale_adam_state(state: optax.OptState, scale_factor: Scalar) -> optax.OptState:
-    """
-    Recursively searches for Adam/AdaBelief states and rescales moments.
-    Robustly handles optax.chain (tuples) and leaf states (NamedTuples).
+    """Recursively search for Adam/AdaBelief states and rescale moments.
+
+    Robustly handles optax.chain (tuples/lists) and leaf states (NamedTuples).
     """
     # 1. Identify Adam/AdaBelief State (Target)
     if hasattr(state, "mu") and hasattr(state, "nu"):
@@ -258,9 +213,8 @@ def _rescale_adam_state(state: optax.OptState, scale_factor: Scalar) -> optax.Op
             mu=otu.tree_scale(scale_factor, state.mu), nu=otu.tree_scale(scale_factor**2, state.nu)
         )
 
-    # 2. Recurse into Containers (optax.chain uses plain tuples)
+    # 2. Recurse into Containers (optax.chain uses plain tuples/lists)
     # CRITICAL FIX: We must exclude NamedTuples (like EmptyState) from this check.
-    # Plain tuples do not have `_fields`; NamedTuples do.
     elif isinstance(state, tuple | list) and not hasattr(state, "_fields"):
         return type(state)(_rescale_adam_state(s, scale_factor) for s in state)
 
@@ -286,6 +240,8 @@ class ActiveSetState(NamedTuple):
     best_f: Scalar  # best function value seen so far
     f_val: Scalar  # current function value
     prev_f: Scalar  # previous function value
+    # KKT termination: physical-space projected gradient norm
+    gnorm_proj: Scalar
 
 
 def active_set(
@@ -298,6 +254,17 @@ def active_set(
     max_constraints_to_release: Union[int, float] | None = None,
     verbose_print: bool = False,
 ) -> optax.GradientTransformation:
+    """Active-set descent transformation with TNC-style scaling.
+
+    Maps physical parameters x ∈ [lower, upper] to a normalized internal space
+    y = (x − offset) / xscale, tracks per-parameter pivot flags
+    (0=free, ±1=at bound, 2=constant), and at each step releases the Top-K
+    active constraints whose negative gradient points into the feasible region.
+
+    References:
+        Kabalan et al. (2025), arXiv:2604.08463 — ADABK / AdaTopK active set
+    """
+
     def init_fn(params: PyTree[Float[Array, " P"]]) -> ActiveSetState:
         lo = lower if lower is not None else otu.tree_full_like(params, -jnp.inf)
         up = upper if upper is not None else otu.tree_full_like(params, jnp.inf)
@@ -306,7 +273,6 @@ def active_set(
         total_params = sum(leaf.size for leaf in leaves)
 
         if max_constraints_to_release is None:
-            # Default: 10% of params
             k_val = max(1, total_params // 10)
         elif isinstance(max_constraints_to_release, float):
             k_val = max(1, int(total_params * max_constraints_to_release))
@@ -336,7 +302,6 @@ def active_set(
         xscale = jtu.tree_map(_init_scale, params, lo, up)
         offset = jtu.tree_map(_init_offset, params, lo, up)
 
-        # Calculate internal Y: y = (x - offset) / scale
         y_int = otu.tree_div(otu.tree_sub(params, offset), xscale)
         pivot = _compute_initial_pivot(y_int, lo, up, xscale, offset)
 
@@ -357,6 +322,7 @@ def active_set(
             best_f=jnp.array(jnp.inf),
             f_val=jnp.array(jnp.inf),
             prev_f=jnp.array(jnp.inf),
+            gnorm_proj=jnp.array(jnp.inf),
         )
 
     def update_fn(
@@ -371,34 +337,38 @@ def active_set(
         if params is None or value_fn is None:
             raise ValueError("active_set requires 'params' and 'value_fn' arguments.")
         if value is None:
-            # We need value for line search, but optax doesn't always provide it.
-            # However, in furax it should be provided.
             value = value_fn(params)
 
         # --- 1. Internal Representation ---
-        # Current internal point y
         y_int = otu.tree_div(otu.tree_sub(params, state.offset), state.xscale)
 
         # Scale Gradients to Internal Space: g_int = g_phys * xscale * fscale
         grads_int = otu.tree_scale(state.fscale, otu.tree_mul(grads, state.xscale))
 
         # --- 2. Release Active Constraints ---
-        # If gradient points inward from a bound, release it (set pivot to 0)
-        # TNC does this *before* projection
         pivot, constraints_released = _release_constraints(
             state.pivot, grads_int, state.max_release_k
         )
 
         # --- 3. Project Gradients (Input Masking) ---
-        # If pivot != 0, set gradient to 0 so the solver "thinks" we are optimal there
         grads_int_proj = jax.tree.map(lambda p, pk: jnp.where(p == 0, pk, 0.0), pivot, grads_int)
 
-        # --- 4. Dynamic Rescaling (TNC Logic) ---
-        gnorm = otu.tree_norm(grads_int_proj)
-        safe_gnorm = gnorm + 1e-20
-        should_rescale = (gnorm > 1e-20) & (jnp.abs(jnp.log10(safe_gnorm)) > rescale_threshold)
+        # Internal-space projected gradient norm — used below for dynamic rescaling.
+        gnorm_int_proj = otu.tree_norm(grads_int_proj)
 
-        # If rescaling, we scale the gradients AND fscale
+        # --- 3b. KKT projected gradient norm in PHYSICAL space (for termination) ---
+        # The internal-space norm is inflated by ``fscale`` during dynamic
+        # rescaling and is unsuitable as a KKT measure. The physical-space
+        # projected gradient norm goes to zero at any KKT point, by definition.
+        grads_phys_proj = jax.tree.map(lambda p, g: jnp.where(p == 0, g, 0.0), pivot, grads)
+        gnorm_proj = otu.tree_norm(grads_phys_proj)
+
+        # --- 4. Dynamic Rescaling (TNC Logic) ---
+        safe_gnorm = gnorm_int_proj + 1e-20
+        should_rescale = (gnorm_int_proj > 1e-20) & (
+            jnp.abs(jnp.log10(safe_gnorm)) > rescale_threshold
+        )
+
         grads_int_proj = otu.tree_where(
             should_rescale, otu.tree_scale(1.0 / safe_gnorm, grads_int_proj), grads_int_proj
         )
@@ -411,36 +381,24 @@ def active_set(
         )
 
         # --- 5. Compute Direction (pk) ---
-        # Use inner solver (Adam/LBFGS). Note: We pass internal gradients.
         pk, new_dir_state = direction_solver.update(grads_int_proj, current_dir_state, params)
 
         # --- FIX 4: AdaBelief nu degeneration fallback ---
         pk = jax.tree.map(lambda p, pk: jnp.where(p == 0, pk, 0.0), state.pivot, pk)
 
         # --- 6. Step Limit (spe) ---
-        # Calculate maximum step `spe` along `pk` before hitting ANY bound.
         pk_norm = otu.tree_norm(pk)
-
-        # TNC heuristic for max unconstrained step
         ustpmax = state.stepmx / (pk_norm + 1e-20)
-
-        # Distance to nearest bound along pk
         spe = _compute_step_max(
             ustpmax, y_int, pk, pivot, state.lower, state.upper, state.xscale, state.offset
         )
 
         # --- 7. Line Search ---
-        # We need to wrap value_fn so Line Search sees Internal Space
         def internal_value_fn(y_candidate: PyTree[Float[Array, " P"]]) -> Scalar:
-            # Unscale y -> x
             x_candidate = otu.tree_add(otu.tree_mul(y_candidate, state.xscale), state.offset)
-            # Clip x_candidate to ensure physical bounds aren't violated by float noise
             x_candidate = jtu.tree_map(jnp.clip, x_candidate, state.lower, state.upper)
-            return value_fn(x_candidate) * new_fscale  # Line search sees scaled function value
+            return value_fn(x_candidate) * new_fscale
 
-        # Optax LS typically calculates: param + update
-        # We pass y_int as params, pk as update.
-        # LS returns `scaled_update` which is (alpha * pk)
         ls_update_int, new_ls_state = linesearch_solver.update(
             pk,
             state.linesearch_state,
@@ -451,38 +409,21 @@ def active_set(
         )
 
         # --- 8. Step Clamping & Pivot Update ---
-        # ls_update_int represents the desired step.
-        # We must clamp its magnitude to `spe` * norm(pk)
-
-        ls_step_len = otu.tree_norm(ls_update_int)  # approx alpha * pk_norm
-
-        # Max length allowed = spe * pk_norm
+        ls_step_len = otu.tree_norm(ls_update_int)
         max_len = spe * pk_norm
-
-        # If ls_step_len > max_len, we hit the wall.
         hit_wall = ls_step_len > max_len + 1e-10
-
-        # Clamp factor
         clamp_scale = jnp.where(hit_wall, max_len / (ls_step_len + 1e-20), 1.0)
-
         final_update_int = otu.tree_scale(clamp_scale, ls_update_int)
 
-        # If we clamped (hit wall), we must update the pivot to lock that variable
-        # We pass the step size 'spe' implicitly by calculating where we land
         final_pivot = lax.cond(
             hit_wall,
             lambda: _update_pivot_at_boundary(
                 y_int, pk, pivot, state.lower, state.upper, state.xscale, state.offset, spe
             ),
-            lambda: pivot,  # No change if we didn't hit wall
+            lambda: pivot,
         )
 
         # --- 9. Unscale Updates ---
-        # x_new = x_old + dx
-        # y_new = y_old + dy
-        # (x_new - off)/sc = (x_old - off)/sc + dy
-        # x_new = x_old + dy * sc
-        # So physical update = internal update * xscale
         updates_phys = otu.tree_mul(final_update_int, state.xscale)
 
         new_last_release = jnp.where(constraints_released, state.count + 1, state.last_release_step)
@@ -504,8 +445,189 @@ def active_set(
             best_f=jnp.minimum(state.best_f, value),
             f_val=value,
             prev_f=state.f_val,
+            gnorm_proj=gnorm_proj,
         )
 
         return updates_phys, new_state
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+# =============================================================================
+# Optimistix wrapper: KKT termination + cooldown
+# =============================================================================
+
+
+class ActiveSetMinimiser(optx.OptaxMinimiser):
+    """Optimistix wrapper around an active-set optax transformation.
+
+    Implements a robust termination protocol combining a KKT (projected
+    gradient norm) test with a Cauchy y-space fallback (gated by a relaxed
+    gradient-magnitude check to avoid false convergence on line-search
+    stalls), plus a cooldown window after each constraint release to absorb
+    transient spikes.
+
+    References:
+        Bertsekas (1982) — projected Newton for bound-constrained optimization
+        Lin & Moré (1999) — Newton's method for large bound-constrained
+    """
+
+    cooldown_steps: int
+    verbose_print: bool
+
+    def __init__(
+        self,
+        optim,
+        atol,
+        rtol,
+        cooldown_steps: int = 20,
+        verbose_print: bool = False,
+        **kwargs: Any,
+    ):
+        super().__init__(optim, atol=atol, rtol=rtol, **kwargs)
+        self.cooldown_steps = cooldown_steps
+        self.verbose_print = verbose_print
+
+    def terminate(
+        self,
+        fn: Any,
+        y: PyTree,
+        args: PyTree,
+        options: dict[str, Any],
+        state: Any,
+        tags: frozenset[object],
+    ) -> tuple[Bool[Array, ""], optx.RESULTS]:
+        del fn, args, options
+        ast = state.opt_state  # ActiveSetState
+
+        # Scale by best_f so termination is invariant to absolute objective magnitude.
+        scale = jnp.maximum(1.0, jnp.abs(ast.best_f))
+
+        # PRIMARY: KKT condition on the physical-space projected gradient.
+        # Goes to zero at any true stationary point of the constrained problem.
+        kkt_tol = self.atol + self.rtol * scale
+        grad_converged = ast.gnorm_proj < kkt_tol
+
+        # SECONDARY (anti-stall): Cauchy y-convergence is allowed to fire only
+        # when the gradient is already "small enough" — using sqrt(tol) as a
+        # relaxed threshold. This catches the numerical floor of the rescaling
+        # pipeline (gnorm bottoms out at ~1e-7 because of fscale roundoff) but
+        # cannot satisfy the strict KKT bound. Gated by ``state.terminate``
+        # (optimistix Cauchy) to avoid firing on pure line-search stalls.
+        relaxed_tol = jnp.sqrt(self.atol) + jnp.sqrt(self.rtol) * scale
+        grad_small_enough = ast.gnorm_proj < relaxed_tol
+
+        f_diff = jnp.abs(ast.f_val - ast.prev_f)  # reported for debug only
+        converged = grad_converged | (state.terminate & grad_small_enough)
+
+        # Cooldown: suppress termination during the window after a release,
+        # because the transient may artificially satisfy convergence checks.
+        steps_since_release = ast.count - ast.last_release_step
+        in_cooldown = (ast.last_release_step >= 0) & (steps_since_release < self.cooldown_steps)
+        override = ast.constraints_released | in_cooldown
+
+        terminate = jnp.where(override, False, converged)
+
+        if self.verbose_print:
+            jax.debug.print(
+                "step={s} | f={f:.4e} best_f={bf:.4e} gnorm={gn:.4e} f_diff={fd:.4e} "
+                "scale={sc:.4e} | kkt={kkt} cauchy={cau} cooldown={cd} released={rel} "
+                "=> terminate={t}",
+                s=ast.count,
+                f=ast.f_val,
+                bf=ast.best_f,
+                gn=ast.gnorm_proj,
+                fd=f_diff,
+                sc=scale,
+                kkt=grad_converged,
+                cau=state.terminate,
+                cd=in_cooldown,
+                rel=ast.constraints_released,
+                t=terminate,
+            )
+
+        return terminate, optx.RESULTS.successful
+
+
+# =============================================================================
+# ADABK solver factory
+# =============================================================================
+
+
+def _parse_adabk_k(solver_name: str) -> float | None:
+    """Parse the trailing integer of ``ADABK{N}`` → release fraction ``N × 0.1``."""
+    if not solver_name.startswith("ADABK"):
+        return None
+    if len(solver_name) <= 5:
+        return None
+    try:
+        return int(solver_name[5:]) * 0.1
+    except ValueError:
+        raise ValueError(
+            f"Invalid solver name: {solver_name}. "
+            "When using 'ADABK' prefix, it should be followed by an integer."
+        )
+
+
+def make_adabk_solver(
+    solver_name: str,
+    *,
+    rtol: float,
+    atol: float,
+    max_linesearch_steps: int,
+    lower: Any,
+    upper: Any,
+    verbose_print: bool,
+    cooldown: int,
+    **kwargs: Any,
+) -> optx.BestSoFarMinimiser:
+    """Build an ADABK active-set minimiser wrapped in ``optx.BestSoFarMinimiser``.
+
+    Recognised kwargs:
+
+    * ``learning_rate`` (float, default 1.0) — AdaBelief learning rate.
+    * ``linesearch`` (str, default ``"zoom"``) — ``"zoom"`` or ``"backtracking"``.
+    * ``max_constraints_to_release`` (int|float|None) — overrides the
+      ``ADABK{N}`` prefix parsing. Float is interpreted as a fraction of total
+      params, int as an absolute count.
+
+    References:
+        Kabalan et al. (2025), arXiv:2604.08463 — ADABK / AdaTopK active set
+        Zhuang et al. (2020), NeurIPS — AdaBelief Optimizer
+    """
+    lr = kwargs.pop("learning_rate", 1.0)
+    linesearch_type = kwargs.pop("linesearch", "zoom")
+    max_constraints_to_release = kwargs.pop("max_constraints_to_release", None)
+    if max_constraints_to_release is None:
+        max_constraints_to_release = _parse_adabk_k(solver_name)
+
+    direction = optax.adabelief(learning_rate=lr)
+
+    if linesearch_type == "backtracking":
+        linesearch = _linesearch.scale_by_backtracking_linesearch(
+            max_backtracking_steps=max_linesearch_steps
+        )
+    elif linesearch_type == "zoom":
+        linesearch = _linesearch.scale_by_zoom_linesearch(max_linesearch_steps=max_linesearch_steps)
+    else:
+        raise ValueError(
+            f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
+        )
+
+    return optx.BestSoFarMinimiser(
+        ActiveSetMinimiser(
+            active_set(
+                direction,
+                linesearch,
+                lower=lower,
+                upper=upper,
+                max_constraints_to_release=max_constraints_to_release,
+                verbose_print=verbose_print,
+                **kwargs,
+            ),
+            atol=atol,
+            rtol=rtol,
+            cooldown_steps=cooldown,
+            verbose_print=verbose_print,
+        )
+    )
