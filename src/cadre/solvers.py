@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal, TypeAlias, Union
+from typing import Any, Literal, NamedTuple, TypeAlias, Union
 
 import jax
 import jax.numpy as jnp
 import optax
+import optax.tree_utils as otu
 import optimistix as optx
-from jaxtyping import Array, Float, PyTree
+from jaxtyping import Array, Float, Int, PyTree
 from optax._src import combine, transform
 from optax._src import linesearch as _linesearch
 
@@ -238,6 +239,65 @@ def apply_projection(
         return new_updates, state
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+# =============================================================================
+# PER-STEP HISTORY LOGGING TRANSFORMATION
+# =============================================================================
+
+
+class LogHistoryState(NamedTuple):
+    """State for :func:`log_history`.
+
+    Attributes
+    ----------
+    count : Int[Array, ""]
+        Number of updates logged so far (also the next write index).
+    history : Float[Array, "2 N"]
+        Pre-allocated table. Row 0 is the update (step) L2 norm, row 1 is the
+        objective value, one column per step. Columns at index ``>= count`` are
+        still zero.
+    """
+
+    count: Int[Array, ""]
+    history: Float[Array, "2 N"]
+
+
+def log_history(length: int) -> optax.GradientTransformationExtraArgs:
+    """Record the per-step update norm and objective into a pre-allocated table.
+
+    A pure observer: it returns ``updates`` unchanged and mutates only its own
+    state, so chaining it into an optimizer does not perturb the trajectory. It
+    must be chained **last** so the logged norm is the fully-transformed step,
+    and it relies on ``value=`` being forwarded by ``optimistix.OptaxMinimiser``
+    (the objective at the current iterate).
+
+    Args:
+        length: Number of steps to pre-allocate (``max_iter``). Writes past this
+            are silently dropped by JAX.
+
+    Returns:
+        GradientTransformation whose state carries a ``(2, length)`` history table.
+    """
+
+    def init_fn(params: PyTree[Float[Array, " P"]]) -> LogHistoryState:
+        del params
+        return LogHistoryState(count=jnp.array(0), history=jnp.zeros((2, length)))
+
+    def update_fn(
+        updates: PyTree[Float[Array, " P"]],
+        state: LogHistoryState,
+        params: PyTree[Float[Array, " P"]] | None = None,
+        value: Float[Array, ""] | None = None,
+        **kwargs: Any,
+    ) -> tuple[PyTree[Float[Array, " P"]], LogHistoryState]:
+        del params, kwargs
+        unorm = otu.tree_norm(updates)
+        i = state.count
+        history = state.history.at[0, i].set(unorm).at[1, i].set(value)
+        return updates, LogHistoryState(count=i + 1, history=history)
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
 # =============================================================================

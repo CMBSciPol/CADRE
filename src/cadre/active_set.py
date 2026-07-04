@@ -450,7 +450,9 @@ def active_set(
 
         return updates_phys, new_state
 
-    return optax.GradientTransformation(init_fn, update_fn)
+    # ExtraArgs (not plain GradientTransformation) so optax.chain forwards the
+    # required value/value_fn kwargs when this is chained (e.g. with log_history).
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
 # =============================================================================
@@ -498,7 +500,10 @@ class ActiveSetMinimiser(optx.OptaxMinimiser):
         tags: frozenset[object],
     ) -> tuple[Bool[Array, ""], optx.RESULTS]:
         del fn, args, options
-        ast = state.opt_state  # ActiveSetState
+        # opt_state is a chain tuple (ActiveSetState first) when a log_history
+        # transform is attached; otherwise it is the ActiveSetState directly.
+        opt = state.opt_state
+        ast = opt if isinstance(opt, ActiveSetState) else opt[0]
 
         # Scale by best_f so termination is invariant to absolute objective magnitude.
         scale = jnp.maximum(1.0, jnp.abs(ast.best_f))

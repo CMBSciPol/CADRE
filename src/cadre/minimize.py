@@ -6,6 +6,7 @@ from typing import Any, cast
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 import optimistix as optx
 from jaxtyping import (
@@ -14,10 +15,17 @@ from jaxtyping import (
     PyTree,  # pyright: ignore
     Scalar,
 )
+from optax._src import combine
 
 from ._compat import requires_scipy
 from ._logging import warning
-from .solvers import SELFCONDITIONED_SOLVERS, SOLVER_NAMES, get_solver
+from .solvers import (
+    SELFCONDITIONED_SOLVERS,
+    SOLVER_NAMES,
+    LogHistoryState,
+    get_solver,
+    log_history,
+)
 from .utils import condition
 
 try:
@@ -183,12 +191,29 @@ class UnifiedState(eqx.Module):
         Number of iterations performed.
     solver_state : Any
         Internal solver state (Optimistix state or ScipyMinimizeState).
+    history : Float[Array, "2 N"] | None
+        Per-step history when ``minimize(record_history=True)``, else ``None``.
+        Shape ``(2, max_iter)``: row 0 is the update (step) L2 norm, row 1 is
+        the objective at the *start* of that step (the pre-step iterate), so the
+        final converged objective is not in the table — use ``best_loss`` for
+        that. Slice by ``iter_num`` (``history[:, :iter_num]``); trailing columns
+        are zero.
     """
 
     best_loss: Scalar
     best_y: PyTree[Float[Array, " P"]]
     iter_num: Scalar
     solver_state: Any
+    history: Float[Array, "2 N"] | None = None
+
+
+def _extract_history(state: Any) -> Float[Array, "2 N"] | None:
+    """Pull the ``log_history`` table out of a nested optimistix solver state."""
+    leaves = jtu.tree_leaves(state, is_leaf=lambda x: isinstance(x, LogHistoryState))
+    for leaf in leaves:
+        if isinstance(leaf, LogHistoryState):
+            return leaf.history
+    return None
 
 
 # =============================================================================
@@ -206,6 +231,7 @@ def minimize(
     lower_bound: PyTree[Float[Array, " P"]] | None = None,
     upper_bound: PyTree[Float[Array, " P"]] | None = None,
     precondition: bool = False,
+    record_history: bool = False,
     options: dict[str, Any] | None = None,
     refresh_steps: int = 10,
     **fn_kwargs: Any,
@@ -232,6 +258,14 @@ def minimize(
         Box constraints.
     precondition : bool
         Whether to apply parameter transformation and output scaling.
+    record_history : bool
+        If True, record the per-step update norm and objective value into
+        ``UnifiedState.history`` (a ``(2, max_iter)`` table). Only supported for
+        optax-based solvers (adam, sgd, adabelief, adaw, optax_lbfgs, and the
+        active-set/``ADABK{N}`` family); raises ``ValueError`` otherwise. The
+        logged values are in the solver's internal space, matching ``best_loss``
+        (they differ from the true objective by the constant ``fscale`` only when
+        ``precondition=True``).
     options : dict, optional
         Extra arguments passed to the solver factory (get_solver).
         For active-set solvers (``ADABK{N}`` family) the recognised keys are:
@@ -288,6 +322,22 @@ def minimize(
         **solver_kwargs,
     )
 
+    if record_history:
+        # Only optax-transform-based minimisers forward ``value=f`` into their
+        # chain, which log_history needs. Chain it last so the logged norm is
+        # the fully-transformed step; inject once via tree_at.
+        if solver_type != "optimistix" or not isinstance(solver.solver, optx.OptaxMinimiser):
+            raise ValueError(
+                "record_history is only supported for optax-based solvers "
+                "(adam, sgd, adabelief, adaw, optax_lbfgs, active_set/ADABK*); "
+                f"got solver_name={solver_name!r}."
+            )
+        solver = eqx.tree_at(
+            lambda s: s.solver.optim,
+            solver,
+            combine.chain(solver.solver.optim, log_history(max_iter)),
+        )
+
     if solver_type == "optimistix":
         # Optimistix uses (y, args) signature, wrap fn
         def optx_fn(y, fn_kwargs):
@@ -315,6 +365,7 @@ def minimize(
             best_y=from_opt(sol.state.best_y),
             iter_num=sol.stats["num_steps"],
             solver_state=sol.state,
+            history=_extract_history(sol.state) if record_history else None,
         )
         return from_opt(sol.value), unified_state
 
