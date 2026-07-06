@@ -234,6 +234,7 @@ def minimize(
     record_history: bool = False,
     options: dict[str, Any] | None = None,
     refresh_steps: int = 10,
+    progress: bool = True,
     **fn_kwargs: Any,
 ) -> tuple[PyTree[Float[Array, " P"]], UnifiedState]:
     """
@@ -278,6 +279,10 @@ def minimize(
           steps per iteration (active-set and ``optax_lbfgs`` solvers).
         * ``linesearch`` (str) — linesearch variant for ``optax_lbfgs``
           (``"zoom"`` or ``"backtracking"``).
+    progress : bool
+        Show a per-solve tqdm progress bar (default True; optimistix solvers only). Set False to
+        suppress it -- useful when running MANY minimizations (e.g. a MUSE inner field-MAP inside a
+        ``lax.map``), where the parallel per-solve bars are meaningless.
     **fn_kwargs
         Additional arguments passed to fn.
 
@@ -343,12 +348,15 @@ def minimize(
         def optx_fn(y, fn_kwargs):
             return fn(y, **fn_kwargs)
 
-        # Does optax have TqdmProgressMeter? defined?
-        if not hasattr(optx, "TqdmProgressMeter"):
-            kwargs = {}
-            warning("optx.TqdmProgressMeter not found. Progress meter disabled.")
-        else:
+        # Progress meter: a tqdm bar by default; ``progress=False`` suppresses it (optimistix then falls
+        # back to its no-op NoProgressMeter). Callers that run MANY minimizations -- e.g. a MUSE inner
+        # field-MAP inside a lax.map -- pass ``progress=False`` so the parallel per-solve bars don't spam.
+        if progress and hasattr(optx, "TqdmProgressMeter"):
             kwargs = {"progress_meter": optx.TqdmProgressMeter(refresh_steps=refresh_steps)}
+        else:
+            kwargs = {}
+            if progress:
+                warning("optx.TqdmProgressMeter not found. Progress meter disabled.")
 
         sol = optx.minimise(
             optx_fn,
