@@ -70,6 +70,7 @@ def scipy_minimize(
     upper_bound: PyTree[Float[Array, " P"]] | None = None,
     method: str = "tnc",
     maxiter: int = 1000,
+    options: dict[str, Any] | None = None,
     **fn_kwargs: Any,
 ) -> ScipyMinimizeState:
     """Scipy minimize wrapper that supports vmap via jax.pure_callback.
@@ -92,6 +93,9 @@ def scipy_minimize(
         Scipy optimization method (default "tnc").
     maxiter : int
         Maximum number of iterations.
+    options : dict, optional
+        Options of the scipy method (``scipy.optimize.minimize(options=...)``), such as
+        ``ftol`` or ``maxfun`` for TNC. ``maxiter`` is set by the argument of that name.
     **fn_kwargs
         Additional arguments passed to fn.
 
@@ -119,8 +123,8 @@ def scipy_minimize(
         def scipy_fn(params, fn_kwargs):
             return fn(params, **fn_kwargs)
 
-        # Scipy method handling
-        solver_options = {"disp": False}
+        # Scipy method handling: a fresh dict per call, as jaxopt adds `maxiter` to it
+        solver_options = {"disp": False, **(options or {})}
         if method == "cobyqa":
             try:
                 import cobyqa  # noqa: F401
@@ -279,6 +283,11 @@ def minimize(
           steps per iteration (active-set and ``optax_lbfgs`` solvers).
         * ``linesearch`` (str) — linesearch variant for ``optax_lbfgs``
           (``"zoom"`` or ``"backtracking"``).
+
+        For the scipy solvers (``scipy_tnc``, ``scipy_cobyqa``), the options of the scipy
+        method, such as ``maxfun`` or ``eta`` for TNC. ``rtol`` and ``atol`` set its
+        tolerances (``ftol``, ``gtol`` and ``xtol`` for TNC, ``final_tr_radius`` for COBYQA)
+        unless these options give them explicitly. The dict is not modified.
     progress : bool
         Show a per-solve tqdm progress bar (default True; optimistix solvers only). Set False to
         suppress it -- useful when running MANY minimizations (e.g. a MUSE inner field-MAP inside a
@@ -380,16 +389,17 @@ def minimize(
     elif solver_type == "scipy":
         # Scipy via vmap-compatible scipy_minimize
         method = solver_name.split("_")[1]
-        options = _opts
+        # A copy, so that the caller's dict is untouched; explicit options win over rtol/atol.
+        scipy_options = dict(_opts)
         if method == "tnc":
-            options["ftol"] = atol
-            options["gtol"] = rtol
-            options["xtol"] = atol
+            scipy_options.setdefault("ftol", atol)
+            scipy_options.setdefault("gtol", rtol)
+            scipy_options.setdefault("xtol", atol)
         elif method == "l-bfgs-b":
-            options["ftol"] = atol
-            options["gtol"] = rtol
+            scipy_options.setdefault("ftol", atol)
+            scipy_options.setdefault("gtol", rtol)
         elif method == "cobyqa":  # COBYQA
-            options["final_tr_radius"] = atol
+            scipy_options.setdefault("final_tr_radius", atol)
         state = scipy_minimize(
             fn=fn,
             init_params=init_params,
@@ -397,6 +407,7 @@ def minimize(
             upper_bound=upper_bound,
             method=method,
             maxiter=max_iter,
+            options=scipy_options,
             **fn_kwargs,
         )
 
