@@ -71,6 +71,7 @@ def scipy_minimize(
     method: str = "tnc",
     maxiter: int = 1000,
     options: dict[str, Any] | None = None,
+    host_callback: bool = True,
     **fn_kwargs: Any,
 ) -> ScipyMinimizeState:
     """Scipy minimize wrapper that supports vmap via jax.pure_callback.
@@ -78,6 +79,12 @@ def scipy_minimize(
     This function wraps scipy optimization in a way that is compatible with
     JAX transformations like vmap and lax.map. It uses jax.pure_callback to
     call the host-side scipy solver.
+
+    With ``host_callback=False``, the solver runs on the calling thread instead, with the
+    objective and its gradient jitted. The function must then be called outside JAX
+    transformations, but the objective is traced once rather than evaluated op by op, and
+    it runs in the context of the caller: a mesh set with ``jax.set_mesh``, which is
+    thread-local, is not visible from the thread of the host callback.
 
     Parameters
     ----------
@@ -96,6 +103,9 @@ def scipy_minimize(
     options : dict, optional
         Options of the scipy method (``scipy.optimize.minimize(options=...)``), such as
         ``ftol`` or ``maxfun`` for TNC. ``maxiter`` is set by the argument of that name.
+    host_callback : bool
+        If True (default), run the solver in a ``jax.pure_callback``, compatible with the
+        JAX transformations. If False, run it on the calling thread, outside of them.
     **fn_kwargs
         Additional arguments passed to fn.
 
@@ -108,11 +118,12 @@ def scipy_minimize(
     ------
     ImportError
         If ``cadre[scipy]`` optional dependencies are not installed.
+    ValueError
+        If ``host_callback=False`` is used under a JAX transformation.
     """
     from jaxopt import ScipyBoundedMinimize
 
-    def host_solver_callback(x_init, lower, upper, fn_kwargs):
-        """Host-side scipy solver callback."""
+    def run_solver(x_init, lower, upper, fn_kwargs, jit):
         # Handle bounds
         if lower is None and upper is None:
             bounds = None
@@ -136,12 +147,32 @@ def scipy_minimize(
         solver = ScipyBoundedMinimize(
             fun=scipy_fn,
             method=method,
-            jit=False,
+            jit=jit,
             maxiter=maxiter,
             options=solver_options,
         )
 
-        res = solver.run(x_init, bounds=bounds, fn_kwargs=fn_kwargs)
+        return solver.run(x_init, bounds=bounds, fn_kwargs=fn_kwargs)
+
+    if not host_callback:
+        leaves = jax.tree.leaves((init_params, lower_bound, upper_bound, fn_kwargs))
+        if any(isinstance(leaf, jax.core.Tracer) for leaf in leaves):
+            raise ValueError(
+                "host_callback=False runs the scipy solver on the calling thread, which "
+                "cannot be done under a JAX transformation (jit, vmap...): use "
+                "host_callback=True there."
+            )
+        res = run_solver(init_params, lower_bound, upper_bound, fn_kwargs, jit=True)
+        return ScipyMinimizeState(
+            params=res.params,
+            fun_val=jnp.asarray(res.state.fun_val, dtype=jnp.float32),
+            success=jnp.asarray(res.state.success, dtype=jnp.bool_),
+            iter_num=jnp.asarray(res.state.iter_num, dtype=jnp.int32),
+        )
+
+    def host_solver_callback(x_init, lower, upper, fn_kwargs):
+        """Host-side scipy solver callback."""
+        res = run_solver(x_init, lower, upper, fn_kwargs, jit=False)
 
         # Return numpy arrays for pure_callback
         return {
@@ -239,6 +270,7 @@ def minimize(
     options: dict[str, Any] | None = None,
     refresh_steps: int = 10,
     progress: bool = True,
+    host_callback: bool = True,
     **fn_kwargs: Any,
 ) -> tuple[PyTree[Float[Array, " P"]], UnifiedState]:
     """
@@ -292,6 +324,14 @@ def minimize(
         Show a per-solve tqdm progress bar (default True; optimistix solvers only). Set False to
         suppress it -- useful when running MANY minimizations (e.g. a MUSE inner field-MAP inside a
         ``lax.map``), where the parallel per-solve bars are meaningless.
+    host_callback : bool
+        Scipy solvers only. If True (default), the solver runs in a ``jax.pure_callback``,
+        so that ``minimize`` can be jitted or vmapped; the solver does not jit the
+        objective, which is evaluated on the runtime's callback thread. If False, the
+        solver runs on the calling thread with the objective and its gradient jitted:
+        ``minimize`` must then be called outside JAX transformations, but the objective
+        is traced once and sees the context of the caller, such as a mesh set with
+        ``jax.set_mesh``, which is thread-local and invisible from the callback thread.
     **fn_kwargs
         Additional arguments passed to fn.
 
@@ -408,6 +448,7 @@ def minimize(
             method=method,
             maxiter=max_iter,
             options=scipy_options,
+            host_callback=host_callback,
             **fn_kwargs,
         )
 

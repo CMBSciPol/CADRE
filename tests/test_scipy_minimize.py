@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import warnings
 
 import jax
@@ -65,3 +66,48 @@ def test_options_under_vmap():
         lambda x0: scipy_minimize(quadratic, x0, method="tnc", options={"ftol": 1e-12})
     )(x0s)
     assert jnp.allclose(states.params, TARGET, atol=1e-5)
+
+
+# =============================================================================
+# host_callback=False: the solver on the calling thread
+# =============================================================================
+
+
+def test_calling_thread_matches_host_callback():
+    params, state = run(rtol=1e-12, atol=1e-12)
+    params_ct, state_ct = run(rtol=1e-12, atol=1e-12, host_callback=False)
+    assert jnp.allclose(params_ct, params, rtol=0, atol=1e-10)
+    assert int(state_ct.iter_num) == int(state.iter_num)
+    assert state_ct.solver_state.fun_val.dtype == state.solver_state.fun_val.dtype
+
+
+def test_calling_thread_forwards_fn_kwargs():
+    def objective(x, scale):
+        return scale * quadratic(x)
+
+    params, _ = minimize(
+        objective, X0, solver_name="scipy_tnc", max_iter=200, rtol=1e-12, atol=1e-12,
+        host_callback=False, scale=jnp.array(10.0),
+    )  # fmt: skip
+    assert jnp.allclose(params, TARGET, atol=1e-6)
+
+
+def test_calling_thread_sees_the_mesh():
+    """The objective is traced on the calling thread, where the (thread-local) mesh is set."""
+    seen = []
+
+    def objective(x):
+        seen.append((threading.get_ident(), jax.sharding.get_abstract_mesh().axis_names))
+        return quadratic(x)
+
+    with jax.set_mesh(jax.make_mesh((1,), ("x",))):
+        minimize(objective, X0, solver_name="scipy_tnc", max_iter=50, host_callback=False)
+    assert seen and all(entry == (threading.get_ident(), ("x",)) for entry in seen)
+
+
+def test_calling_thread_rejects_transformations():
+    def solve(x0):
+        return minimize(quadratic, x0, solver_name="scipy_tnc", host_callback=False)[0]
+
+    with pytest.raises(ValueError, match="host_callback"):
+        jax.jit(solve)(X0)
