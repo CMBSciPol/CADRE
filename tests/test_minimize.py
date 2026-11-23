@@ -8,7 +8,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from cadre import minimize
 
 jax.config.update("jax_enable_x64", True)

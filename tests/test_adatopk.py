@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import optimistix as optx
 import pytest
-
 from cadre import AdaTopK, get_solver, minimize
 from cadre.adatopk import release_count
 
@@ -126,9 +125,11 @@ def test_precondition_is_ignored():
 
 def test_record_history():
     _, state = run(max_iter=50, record_history=True)
-    assert state.history.shape == (2, 50)
-    assert float(state.history[1, 0]) == pytest.approx(float(quadratic(X0, TARGET)))
-    assert float(state.history[0, 0]) > 0.0
+    history = state.history
+    assert history is not None
+    assert history.shape == (2, 50)
+    assert float(history[1, 0]) == pytest.approx(float(quadratic(X0, TARGET)))
+    assert float(history[0, 0]) > 0.0
 
 
 @pytest.mark.parametrize(
