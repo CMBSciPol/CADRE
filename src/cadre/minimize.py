@@ -19,11 +19,12 @@ from optax._src import combine
 
 from ._compat import requires_scipy
 from ._logging import warning
+from .adatopk import AdaTopKState
 from .solvers import (
-    SELFCONDITIONED_SOLVERS,
     SOLVER_NAMES,
     LogHistoryState,
     get_solver,
+    is_self_conditioned,
     log_history,
 )
 from .utils import condition
@@ -70,6 +71,7 @@ def scipy_minimize(
     upper_bound: PyTree[Float[Array, " P"]] | None = None,
     method: str = "tnc",
     maxiter: int = 1000,
+    solver_options: dict[str, Any] | None = None,
     **fn_kwargs: Any,
 ) -> ScipyMinimizeState:
     """Scipy minimize wrapper that supports vmap via jax.pure_callback.
@@ -92,6 +94,8 @@ def scipy_minimize(
         Scipy optimization method (default "tnc").
     maxiter : int
         Maximum number of iterations.
+    solver_options : dict, optional
+        Options of the scipy method (e.g. ``ftol``, ``gtol``, ``xtol`` for TNC).
     **fn_kwargs
         Additional arguments passed to fn.
 
@@ -120,7 +124,7 @@ def scipy_minimize(
             return fn(params, **fn_kwargs)
 
         # Scipy method handling
-        solver_options = {"disp": False}
+        scipy_options = {"disp": False, **(solver_options or {})}
         if method == "cobyqa":
             try:
                 import cobyqa  # noqa: F401
@@ -134,7 +138,7 @@ def scipy_minimize(
             method=method,
             jit=False,
             maxiter=maxiter,
-            options=solver_options,
+            options=scipy_options,
         )
 
         res = solver.run(x_init, bounds=bounds, fn_kwargs=fn_kwargs)
@@ -208,7 +212,9 @@ class UnifiedState(eqx.Module):
 
 
 def _extract_history(state: Any) -> Float[Array, "2 N"] | None:
-    """Pull the ``log_history`` table out of a nested optimistix solver state."""
+    """Pull the history table out of an optimistix solver state (AdaTopK or ``log_history``)."""
+    if isinstance(state, AdaTopKState):
+        return state.history
     leaves = jtu.tree_leaves(state, is_leaf=lambda x: isinstance(x, LogHistoryState))
     for leaf in leaves:
         if isinstance(leaf, LogHistoryState):
@@ -258,27 +264,31 @@ def minimize(
     lower_bound, upper_bound : PyTree, optional
         Box constraints.
     precondition : bool
-        Whether to apply parameter transformation and output scaling.
+        Whether to apply parameter transformation and output scaling. Ignored, with a
+        warning, for self-conditioned solvers (AdaTopK ``ADABK{N}``, ``scipy_tnc``,
+        ``scipy_cobyqa``).
     record_history : bool
         If True, record the per-step update norm and objective value into
         ``UnifiedState.history`` (a ``(2, max_iter)`` table). Only supported for
-        optax-based solvers (adam, sgd, adabelief, adaw, optax_lbfgs, and the
-        active-set/``ADABK{N}`` family); raises ``ValueError`` otherwise. The
-        logged values are in the solver's internal space, matching ``best_loss``
-        (they differ from the true objective by the constant ``fscale`` only when
-        ``precondition=True``).
+        optax-based solvers (adam, sgd, adabelief, adaw, optax_lbfgs) and AdaTopK
+        (``ADABK{N}``); raises ``ValueError`` otherwise. The logged values are in the
+        solver's internal space, matching ``best_loss`` (they differ from the true
+        objective by the constant ``fscale`` only when ``precondition=True``; for
+        AdaTopK the step norm is in its internal coordinates).
     options : dict, optional
         Extra arguments passed to the solver factory (get_solver).
-        For active-set solvers (``ADABK{N}`` family) the recognised keys are:
+        For AdaTopK (``ADABK{N}``) the recognised keys are the fields of
+        :class:`cadre.adatopk.AdaTopK`, among them:
 
         * ``cooldown`` (int, default 20) — steps to suppress termination
           after a constraint release.
         * ``verbose_print`` (bool, default False) — print per-step debug
           info via ``jax.debug.print`` (JIT-compatible).
-        * ``max_linesearch_steps`` (int, default 50) — maximum line-search
-          steps per iteration (active-set and ``optax_lbfgs`` solvers).
-        * ``linesearch`` (str) — linesearch variant for ``optax_lbfgs``
-          (``"zoom"`` or ``"backtracking"``).
+        * ``max_linesearch_steps`` (int, default 30; 50 for ``optax_lbfgs``
+          and ``sgd``) — maximum line-search steps per iteration.
+
+        For ``optax_lbfgs``, ``linesearch`` (str) selects the line search
+        (``"zoom"`` or ``"backtracking"``).
     progress : bool
         Show a per-solve tqdm progress bar (default True; optimistix solvers only). Set False to
         suppress it -- useful when running MANY minimizations (e.g. a MUSE inner field-MAP inside a
@@ -295,7 +305,7 @@ def minimize(
     """
     solver_name = cast(SOLVER_NAMES, solver_name)
 
-    if solver_name in SELFCONDITIONED_SOLVERS and precondition:
+    if is_self_conditioned(solver_name) and precondition:
         warning(f"Solver '{solver_name}' is self-conditioned; ignoring preconditioning request.")
         precondition = False
 
@@ -317,6 +327,9 @@ def minimize(
     _opts = options or {}
     cooldown = _opts.get("cooldown", 20)
     solver_kwargs = {k: v for k, v in _opts.items() if k != "cooldown"}
+    adatopk = solver_name.startswith("ADABK")
+    if record_history and adatopk:
+        solver_kwargs["history_length"] = max_iter  # AdaTopK records its own history
     solver, solver_type = get_solver(
         solver_name,
         rtol=rtol,
@@ -327,14 +340,14 @@ def minimize(
         **solver_kwargs,
     )
 
-    if record_history:
+    if record_history and not adatopk:
         # Only optax-transform-based minimisers forward ``value=f`` into their
         # chain, which log_history needs. Chain it last so the logged norm is
         # the fully-transformed step; inject once via tree_at.
         if solver_type != "optimistix" or not isinstance(solver.solver, optx.OptaxMinimiser):
             raise ValueError(
                 "record_history is only supported for optax-based solvers "
-                "(adam, sgd, adabelief, adaw, optax_lbfgs, active_set/ADABK*); "
+                "(adam, sgd, adabelief, adaw, optax_lbfgs) and AdaTopK (ADABK*); "
                 f"got solver_name={solver_name!r}."
             )
         solver = eqx.tree_at(
@@ -370,7 +383,7 @@ def minimize(
 
         unified_state = UnifiedState(
             best_loss=sol.state.best_loss,
-            best_y=from_opt(sol.state.best_y),
+            best_y=from_opt(sol.value),  # postprocess returns the best point
             iter_num=sol.stats["num_steps"],
             solver_state=sol.state,
             history=_extract_history(sol.state) if record_history else None,
@@ -380,16 +393,14 @@ def minimize(
     elif solver_type == "scipy":
         # Scipy via vmap-compatible scipy_minimize
         method = solver_name.split("_")[1]
-        options = _opts
+        # A copy: the caller's options dict is left unchanged.
+        scipy_options = dict(solver_kwargs)
         if method == "tnc":
-            options["ftol"] = atol
-            options["gtol"] = rtol
-            options["xtol"] = atol
+            scipy_options.update(ftol=atol, gtol=rtol, xtol=atol)
         elif method == "l-bfgs-b":
-            options["ftol"] = atol
-            options["gtol"] = rtol
+            scipy_options.update(ftol=atol, gtol=rtol)
         elif method == "cobyqa":  # COBYQA
-            options["final_tr_radius"] = atol
+            scipy_options["final_tr_radius"] = atol
         state = scipy_minimize(
             fn=fn,
             init_params=init_params,
@@ -397,6 +408,7 @@ def minimize(
             upper_bound=upper_bound,
             method=method,
             maxiter=max_iter,
+            solver_options=scipy_options,
             **fn_kwargs,
         )
 

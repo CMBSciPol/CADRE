@@ -1,7 +1,7 @@
 """CADRE — Constraint-Aware Descent Routine Executor.
 
 A JAX-native optimization library providing:
-- Active-set constrained optimization (ADABK family)
+- AdaTopK, an active-set minimiser for box constraints (ADABK family)
 - L-BFGS with zoom/backtracking linesearch
 - Unified interface to optax, optimistix, and scipy solvers
 - Parameter conditioning and box projection utilities
@@ -9,7 +9,7 @@ A JAX-native optimization library providing:
 
 from importlib import metadata
 
-from .active_set import ActiveSetState, active_set
+from .adatopk import AdaTopK, AdaTopKState
 from .minimize import ScipyMinimizeState, UnifiedState, minimize, scipy_minimize
 from .solvers import (
     SELFCONDITIONED_SOLVERS,
@@ -23,8 +23,8 @@ from .utils import condition
 
 __all__ = [
     # Core optimizer
-    "active_set",
-    "ActiveSetState",
+    "AdaTopK",
+    "AdaTopKState",
     # Unified interface
     "minimize",
     "scipy_minimize",

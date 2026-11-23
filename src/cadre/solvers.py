@@ -11,13 +11,13 @@ from jaxtyping import Array, Float, Int, PyTree
 from optax._src import combine, transform
 from optax._src import linesearch as _linesearch
 
-from .active_set import ActiveSetMinimiser, active_set, make_adabk_solver
+from .adatopk import AdaTopK
 
 # =============================================================================
 # OFF-THE-SHELF L-BFGS SOLVERS
 # =============================================================================
 
-Solver: TypeAlias = Union[optx.BestSoFarMinimiser, str]
+Solver: TypeAlias = Union[optx.BestSoFarMinimiser, AdaTopK, str]
 
 
 def lbfgs_zoom(
@@ -138,38 +138,6 @@ def lbfgs_backtrack(
             scale_init_precond=scale_init_precond,
         ),
         base_scaling,
-        linesearch,
-    ]
-
-    # Add projection if bounds provided
-    if lower is not None and upper is not None:
-        chain_components.append(apply_projection(lower, upper))
-
-    return combine.chain(*chain_components)
-
-
-def backtracking_adam(
-    max_backtracking_steps: int = 200,
-    slope_rtol: float = 1e-4,
-    decrease_factor: float = 0.8,
-    increase_factor: float = 1.5,
-    max_learning_rate: float = 1.0,
-    verbose: bool = False,
-    lower: PyTree[Float[Array, " P"]] | None = None,
-    upper: PyTree[Float[Array, " P"]] | None = None,
-) -> optax.GradientTransformation:
-    """Adam with backtracking linesearch (Armijo condition only)."""
-    linesearch = _linesearch.scale_by_backtracking_linesearch(
-        max_backtracking_steps=max_backtracking_steps,
-        slope_rtol=slope_rtol,
-        decrease_factor=decrease_factor,
-        increase_factor=increase_factor,
-        max_learning_rate=max_learning_rate,
-        verbose=verbose,
-    )
-
-    chain_components = [
-        optax.adam(learning_rate=1.0),  # Learning rate handled by linesearch
         linesearch,
     ]
 
@@ -312,10 +280,7 @@ SOLVER_NAMES = Literal[
     "sgd",
     "adabelief",
     "adaw",
-    "active_set",
-    "active_set_sgd",
-    "active_set_adabelief",
-    "active_set_adaw",
+    # AdaTopK: "ADABK{N}", matched by prefix in get_solver
     # Optimistix BFGS
     "optimistix_bfgs",
     # Optimistix L-BFGS
@@ -333,7 +298,14 @@ SOLVER_NAMES = Literal[
     "backtrack",
 ]
 
-SELFCONDITIONED_SOLVERS = {"active_set", "active_set_sgd", "scipy_tnc", "scipy_cobyqa"}
+# Solvers that scale the parameters themselves; minimize() ignores precondition=True for
+# them. AdaTopK ("ADABK{N}") is matched by prefix, see is_self_conditioned.
+SELFCONDITIONED_SOLVERS = {"scipy_tnc", "scipy_cobyqa"}
+
+
+def is_self_conditioned(solver_name: str) -> bool:
+    """Whether the solver scales the parameters itself (precondition is then ignored)."""
+    return solver_name in SELFCONDITIONED_SOLVERS or solver_name.startswith("ADABK")
 
 
 def get_solver(
@@ -341,7 +313,7 @@ def get_solver(
     rtol: float = 1e-8,
     atol: float = 1e-8,
     learning_rate: float = 1e-3,
-    max_linesearch_steps: int = 50,
+    max_linesearch_steps: int | None = None,
     lower: PyTree[Float[Array, " P"]] | None = None,
     upper: PyTree[Float[Array, " P"]] | None = None,
     verbose_print: bool = False,
@@ -361,30 +333,35 @@ def get_solver(
         Absolute tolerance for optimistix solvers.
     learning_rate : float
         Learning rate for adam solver.
-    max_linesearch_steps : int
-        Maximum linesearch steps for L-BFGS solvers.
+    max_linesearch_steps : int, optional
+        Maximum line-search steps per iteration (``optax_lbfgs``, ``sgd``: default 50;
+        AdaTopK: default 30, see :class:`cadre.adatopk.AdaTopK`).
     lower : PyTree, optional
-        Lower bounds for box projection (optax solvers only).
+        Lower bounds (box projection for the optax solvers, box of AdaTopK).
     upper : PyTree, optional
-        Upper bounds for box projection (optax solvers only).
+        Upper bounds (box projection for the optax solvers, box of AdaTopK).
     verbose_print : bool
-        If True, print per-step termination diagnostics for active-set
-        solvers via ``jax.debug.print`` (JIT-compatible).
+        If True, AdaTopK prints per-step diagnostics via ``jax.debug.print``
+        (JIT-compatible).
     cooldown : int
-        Steps to suppress termination after a constraint release
-        (active-set solvers only).
-    max_linesearch_steps : int
-        Maximum line-search steps per iteration (active-set and
-        ``optax_lbfgs`` solvers).
+        Steps to suppress termination after a constraint release (AdaTopK only).
+    **kwargs
+        Further solver options; for AdaTopK, the fields of :class:`cadre.adatopk.AdaTopK`.
 
     Returns
     -------
-    solver : Solver can be either a BestSoFar wrapped minimiser or a string for scipy.
-        The solver instance.
+    solver : Solver
+        The solver instance: an optimistix minimiser (BestSoFar-wrapped, or AdaTopK), or a
+        string for scipy.
     solver_type : str
         One of "optimistix", "scipy".
     """
-    # Resolve aliases
+    # Legacy aliases of optax_lbfgs with a given line search.
+    if solver_name in ("zoom", "backtrack"):
+        kwargs.setdefault("linesearch", "zoom" if solver_name == "zoom" else "backtracking")
+        solver_name = "optax_lbfgs"
+    # AdaTopK keeps its own default line-search length; the other solvers use 50.
+    ls_steps = 50 if max_linesearch_steps is None else max_linesearch_steps
     # Optax solvers (with optional box projection)
     if solver_name == "optax_lbfgs":
         linesearch_type = kwargs.pop("linesearch", "zoom")
@@ -392,7 +369,7 @@ def get_solver(
             return optx.BestSoFarMinimiser(
                 optx.OptaxMinimiser(
                     lbfgs_zoom(
-                        max_linesearch_steps=max_linesearch_steps,
+                        max_linesearch_steps=ls_steps,
                         lower=lower,
                         upper=upper,
                         **kwargs,
@@ -405,7 +382,7 @@ def get_solver(
             return optx.BestSoFarMinimiser(
                 optx.OptaxMinimiser(
                     lbfgs_backtrack(
-                        max_backtracking_steps=max_linesearch_steps,
+                        max_backtracking_steps=ls_steps,
                         lower=lower,
                         upper=upper,
                         **kwargs,
@@ -434,9 +411,7 @@ def get_solver(
         lr = kwargs.pop("learning_rate", 1.0)
         direction = optax.sgd(learning_rate=lr)
         # Keep your line search
-        linesearch = _linesearch.scale_by_backtracking_linesearch(
-            max_backtracking_steps=max_linesearch_steps
-        )
+        linesearch = _linesearch.scale_by_backtracking_linesearch(max_backtracking_steps=ls_steps)
         if lower is not None and upper is not None:
             sgd_opt = combine.chain(direction, linesearch, apply_projection(lower, upper))
         else:
@@ -456,125 +431,25 @@ def get_solver(
         if lower is not None and upper is not None:
             opt = combine.chain(opt, apply_projection(lower, upper))
         return optx.BestSoFarMinimiser(optx.OptaxMinimiser(opt, atol=atol, rtol=rtol)), "optimistix"
-    elif solver_name == "active_set":
-        # Default configuration for active set: Adam + configurable linesearch
-        # Extract learning_rate and linesearch options
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "backtracking")
-
-        direction = optax.adam(learning_rate=lr)
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
+    elif solver_name.startswith("ADABK"):
+        # AdaTopK (cadre.adatopk); its own default line-search length unless one is given.
+        if solver_name[5:] and not solver_name[5:].isdigit():
             raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
+                f"Invalid AdaTopK solver name {solver_name!r}: expected 'ADABK' followed by a "
+                "non-negative integer N (a fraction N / 10 of the constraints released), e.g. "
+                "'ADABK0'."
             )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
-        ), "optimistix"
-    elif solver_name == "active_set_sgd":
-        # Default configuration for active set SGD: SGD + configurable linesearch
-        # Extract learning_rate and linesearch options
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "backtracking")
-
-        direction = optax.sgd(learning_rate=lr)
-
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
-        ), "optimistix"
-    elif solver_name == "active_set_adabelief" or solver_name.startswith("ADABK"):
-        return make_adabk_solver(
-            solver_name,
+        if max_linesearch_steps is not None:
+            kwargs["max_linesearch_steps"] = max_linesearch_steps
+        return AdaTopK(
             rtol=rtol,
             atol=atol,
-            max_linesearch_steps=max_linesearch_steps,
             lower=lower,
             upper=upper,
-            verbose_print=verbose_print,
+            solver_name=solver_name,
             cooldown=cooldown,
+            verbose_print=verbose_print,
             **kwargs,
-        ), "optimistix"
-    elif solver_name == "active_set_adaw":
-        lr = kwargs.pop("learning_rate", 1.0)
-        linesearch_type = kwargs.pop("linesearch", "backtracking")
-
-        direction = optax.adamw(learning_rate=lr)
-
-        if linesearch_type == "backtracking":
-            linesearch = _linesearch.scale_by_backtracking_linesearch(
-                max_backtracking_steps=max_linesearch_steps
-            )
-        elif linesearch_type == "zoom":
-            linesearch = _linesearch.scale_by_zoom_linesearch(
-                max_linesearch_steps=max_linesearch_steps
-            )
-        else:
-            raise ValueError(
-                f"Unknown linesearch type: {linesearch_type}. Use 'backtracking' or 'zoom'."
-            )
-
-        return optx.BestSoFarMinimiser(
-            ActiveSetMinimiser(
-                active_set(
-                    direction,
-                    linesearch,
-                    lower=lower,
-                    upper=upper,
-                    verbose_print=verbose_print,
-                    **kwargs,
-                ),
-                atol=atol,
-                rtol=rtol,
-                cooldown_steps=cooldown,
-                verbose_print=verbose_print,
-            )
         ), "optimistix"
     # Optimistix BFGS
     elif solver_name == "optimistix_bfgs":
