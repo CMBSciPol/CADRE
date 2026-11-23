@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docs: minimization](https://img.shields.io/badge/docs-minimization-blue)](https://furax-cs.readthedocs.io/en/latest/minimization.html)
 
-CADRE provides a unified interface to multiple JAX-compatible optimization backends, with first-class support for box-constrained problems via an active-set method (ADABK family).
+CADRE provides a unified interface to multiple JAX-compatible optimization backends, with first-class support for box-constrained problems via AdaTopK, an active-set method (ADABK family).
 
 This is the minimizer used in [Furax-CS](https://github/CMBSciPol/furax-cs) package for CMB component separation.
 
@@ -53,8 +53,8 @@ print(f"Optimal params: {params}")
 
 | Solver | Description |
 |--------|-------------|
-| `ADABK0` | Active-set + AdaBelief, 1 constraint released/step. **Best for noisy landscapes.** |
-| `ADABK{N}` | Active-set + AdaBelief, up to `N×10 %` constraints released/step. |
+| `ADABK0` | AdaTopK: active set + AdaBelief, 1 constraint released/step. **Best for noisy landscapes.** |
+| `ADABK{N}` | AdaTopK, up to `N×10 %` constraints released/step. |
 | `optax_lbfgs` | L-BFGS with zoom linesearch. **Best for smooth landscapes.** |
 | `adam`, `adabelief`, `adaw`, `sgd` | First-order optax solvers with optional projection. |
 | `optimistix_bfgs/lbfgs/ncg_*` | Optimistix solvers. |
@@ -65,14 +65,15 @@ Full solver documentation and ADABK internals:
 
 ## Advanced usage
 
+`AdaTopK` is an `optimistix` minimiser and can be used directly:
+
 ```python
-from cadre import get_solver
 import optimistix as optx
+from cadre import AdaTopK
 
-solver, _ = get_solver("ADABK0", rtol=1e-6, atol=1e-6)
-
-state = solver.init(loss, init_params, target, {}, f_struct, None, frozenset())
-# ... step manually
+solver = AdaTopK(rtol=0.0, atol=1e-10, lower=lower, upper=upper)
+sol = optx.minimise(lambda p, t: loss(p, t), solver, jnp.zeros(3), target, max_steps=1000, throw=False)
+print(sol.value, sol.stats["num_steps"])
 ```
 
 ## License
